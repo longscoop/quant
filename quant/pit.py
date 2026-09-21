@@ -29,26 +29,20 @@ class PITRepository:
             security = self.store.securities.get(code)
             if not security:
                 exclusions[code] = "unknown_security"; continue
-            if hasattr(self.store, "tradability_fact"):
-                fact = self.store.tradability_fact(code, as_of_date, min_listing_days=self.min_listing_days)
-                if fact.is_st:
-                    exclusions[code] = "st"; continue
-                if fact.listing_days < self.min_listing_days:
-                    exclusions[code] = "new_listing"; continue
-                if not fact.has_price:
-                    exclusions[code] = "missing_price"; continue
-                if fact.suspended or fact.limit_up or fact.limit_down:
-                    exclusions[code] = "untradable"; continue
-            else:
-                if security.is_st:
-                    exclusions[code] = "st"; continue
-                if (as_of_date - security.list_date).days < self.min_listing_days:
-                    exclusions[code] = "new_listing"; continue
+            status = self.store.security_status_for(code, as_of_date) if hasattr(self.store, "security_status_for") else None
+            if status.is_st if status is not None else security.is_st:
+                exclusions[code] = "st"; continue
+            if (as_of_date - security.list_date).days < self.min_listing_days:
+                exclusions[code] = "new_listing"; continue
             history = [p for p in self.store.prices_for(code) if p.trade_date <= as_of_date]
             if not history:
                 exclusions[code] = "missing_price"; continue
             last = history[-1]
-            if not hasattr(self.store, "tradability_fact") and (last.suspended or last.limit_up or last.limit_down):
+            if hasattr(self.store, "tradability_fact"):
+                market_fact = self.store.tradability_fact(code, last.trade_date, min_listing_days=self.min_listing_days)
+                if market_fact.suspended or market_fact.limit_up or market_fact.limit_down:
+                    exclusions[code] = "untradable"; continue
+            elif last.suspended or last.limit_up or last.limit_down:
                 exclusions[code] = "untradable"; continue
             visible = [f for f in self.store.financials_for(code) if (f.available_at or f.ann_date) <= as_of_date]
             if not visible:
