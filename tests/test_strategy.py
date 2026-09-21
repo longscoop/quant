@@ -112,6 +112,33 @@ class StrategyTests(unittest.TestCase):
         self.assertIn("legacy_factor_aliases", result.metadata)
         self.assertEqual(result.metadata["legacy_factor_aliases"], {"risk": "low_volatility"})
 
+    def test_backtest_turnover_comes_from_target_changes_not_constants(self):
+        from quant.backtest import BacktestConfig, run_backtest
+        from quant.types import BenchmarkBar, Position, PriceBar, PredictionRow, PredictionSnapshot
+
+        store = InMemoryStore()
+        for code in ("000001.SZ", "000002.SZ"):
+            store.securities[code] = __import__("quant.types", fromlist=["Security"]).Security(code, code, date(2020, 1, 1))
+        days = [date(2024, 1, 31), date(2024, 2, 1), date(2024, 2, 29), date(2024, 3, 1), date(2024, 3, 29)]
+        for day in days:
+            for code in ("000001.SZ", "000002.SZ"):
+                store.prices[(code, day)] = PriceBar(code, day, 10.0, open=10.0)
+            store.benchmarks[("000300.SH", day)] = BenchmarkBar("000300.SH", day, 100.0, 100.0)
+        prediction = PredictionSnapshot([
+            PredictionRow(date(2024, 1, 31), "000001.SZ", 1.0),
+            PredictionRow(date(2024, 2, 29), "000001.SZ", 1.0),
+        ], {})
+
+        with patch("quant.backtest.select_positions", side_effect=[
+            [Position(date(2024, 1, 31), "000001.SZ", 1.0, 1.0)],
+            [Position(date(2024, 2, 29), "000001.SZ", 1.0, 1.0)],
+        ]):
+            result = run_backtest(BacktestConfig(top_n=1, transaction_cost_bps=10.0), prediction, PITRepository(store))
+
+        self.assertAlmostEqual(result.metrics["turnover"], 1.0)
+        self.assertAlmostEqual(result.metrics["annualized_turnover"], 6.0)
+        self.assertAlmostEqual(result.metrics["total_transaction_cost"], .001)
+
     def test_top_n_strategy_returns_equal_weight_tradable_positions(self):
         from quant.types import PredictionRow, PredictionSnapshot
 
