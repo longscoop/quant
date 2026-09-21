@@ -210,13 +210,15 @@ class QlibDatasetAdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "single market"):
             adapter.to_qlib_frame(pd.DataFrame([base, {**base, "market_id": "HK", "canonical_instrument_id": "00700.HK"}]))
 
-    def test_label_uses_context_benchmark_and_calendar_horizon(self):
+    def test_label_uses_executable_next_session_open_and_calendar_horizon(self):
         memory = InMemoryStore()
-        feature_day, label_day = self.sessions[0], self.sessions[20]
-        memory.prices[("000001.SZ", feature_day)] = PriceBar("000001.SZ", feature_day, 10.0)
-        memory.prices[("000001.SZ", label_day)] = PriceBar("000001.SZ", label_day, 12.0)
-        memory.benchmarks[("B1.TEST", feature_day)] = BenchmarkBar("B1.TEST", feature_day, 100.0)
-        memory.benchmarks[("B1.TEST", label_day)] = BenchmarkBar("B1.TEST", label_day, 110.0)
+        feature_day, entry_day, label_day = self.sessions[0], self.sessions[1], self.sessions[20]
+        memory.prices[("000001.SZ", feature_day)] = PriceBar("000001.SZ", feature_day, 9.0, open=9.0)
+        memory.prices[("000001.SZ", entry_day)] = PriceBar("000001.SZ", entry_day, 10.2, open=10.0)
+        memory.prices[("000001.SZ", label_day)] = PriceBar("000001.SZ", label_day, 12.0, open=11.8)
+        memory.benchmarks[("B1.TEST", feature_day)] = BenchmarkBar("B1.TEST", feature_day, 95.0, 95.0)
+        memory.benchmarks[("B1.TEST", entry_day)] = BenchmarkBar("B1.TEST", entry_day, 101.0, 100.0)
+        memory.benchmarks[("B1.TEST", label_day)] = BenchmarkBar("B1.TEST", label_day, 110.0, 109.0)
         memory.benchmarks[("WRONG.TEST", feature_day)] = BenchmarkBar("WRONG.TEST", feature_day, 100.0)
         memory.benchmarks[("WRONG.TEST", label_day)] = BenchmarkBar("WRONG.TEST", label_day, 200.0)
         source = pd.DataFrame([{
@@ -236,7 +238,9 @@ class QlibDatasetAdapterTest(unittest.TestCase):
         )
 
         self.assertAlmostEqual(labeled.iloc[0]["label"], 0.1)
+        self.assertEqual(labeled.iloc[0]["label_start_date"], entry_day)
         self.assertEqual(labeled.iloc[0]["label_end_date"], label_day)
+        self.assertEqual(labeled.attrs["label_definition"], "T+1_OPEN_TO_T+20_CLOSE_EXCESS")
 
     def test_unmatured_or_missing_label_endpoint_is_not_generated(self):
         memory = InMemoryStore()
