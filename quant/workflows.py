@@ -12,6 +12,7 @@ import time
 import pandas as pd
 
 from .backtest import BacktestConfig, run_backtest
+from .execution import execute_target_weights
 from .factor_snapshots import ensure_factor_snapshot
 from .factor_strategy import factor_predictions
 from .factors import FactorEngine
@@ -88,13 +89,27 @@ def save_portfolio_targets(store, portfolio_id: str, targets: dict[str, float], 
 
 
 def reconcile_portfolio_orders(store, portfolio_id: str | None = None) -> dict:
-    """Execute eligible pending orders once at the next real open after T."""
+    """Execute persisted target revisions through the shared T+1 execution kernel."""
+    from .markets.cn import build_cn_market_config
     from .portfolio import project_holdings
 
     memory = _portfolio_memory(store)
     portfolios = [store.get_portfolio(portfolio_id)] if portfolio_id else store.list_portfolios()
     summary = {"portfolio_count": len(portfolios), "completed_orders": 0, "pending_orders": 0, "partial_orders": 0, "failed_orders": 0}
     all_trade_dates = sorted({bar.trade_date for bar in memory.prices.values()})
+
+    reason_text = {
+        "missing_open": "T+1 缺少真实开盘价",
+        "missing_price": "T+1 行情缺失",
+        "suspended": "T+1 停牌不可成交",
+        "limit_up": "T+1 涨停不可买入",
+        "limit_down": "T+1 跌停不可卖出",
+        "st": "T+1 ST 状态不可成交",
+        "new_listing": "T+1 新股过滤不可成交",
+        "unknown_security": "证券主数据缺失",
+        "insufficient_cash_or_position": "可用现金或持仓不足",
+    }
+
     for portfolio in portfolios:
         pid = portfolio["portfolio_id"]
         revisions = {row["revision_id"]: row for row in store.list_portfolio_target_revisions(pid)}
@@ -109,84 +124,115 @@ def reconcile_portfolio_orders(store, portfolio_id: str | None = None) -> dict:
                 store.update_portfolio_revision_status(revision_id, "PENDING")
                 summary["pending_orders"] += len(revision_orders)
                 continue
+
             trades = store.list_portfolio_trades(pid)
-            holdings = project_holdings(trades)
-            holding_map = {row["ts_code"]: row for row in holdings}
+            projected = project_holdings(trades)
+            holdings = {row["ts_code"]: float(row["quantity"]) for row in projected}
             cash = _portfolio_cash(store, pid, execution_date)
             signal_cash = _portfolio_cash(store, pid, revision["signal_date"])
-            signal_value = _portfolio_signal_value(memory, revision["signal_date"], holdings, signal_cash)
+            signal_value = _portfolio_signal_value(memory, revision["signal_date"], projected, signal_cash)
             if signal_value is None:
                 for order in revision_orders:
-                    store.update_portfolio_order(order["order_id"], planned_trade_date=execution_date, status="PENDING", reason="信号日持仓收盘价不完整")
+                    store.update_portfolio_order(
+                        order["order_id"],
+                        planned_trade_date=execution_date,
+                        status="PENDING",
+                        reason="信号日持仓收盘价不完整",
+                    )
                 store.update_portfolio_revision_status(revision_id, "PENDING")
                 summary["pending_orders"] += len(revision_orders)
                 continue
-            for order in sorted(revision_orders, key=lambda row: (0 if row["side"] == "SELL" else 1, row["ts_code"])):
+
+            targets = {
+                row["ts_code"]: float(row["target_weight"])
+                for row in store.get_portfolio_target_items(revision_id)
+                if float(row["target_weight"]) > 0
+            }
+            fee_bps = float(portfolio["transaction_cost_bps"])
+            market_config = build_cn_market_config(memory, cost_bps=fee_bps)
+            order_codes = {row["ts_code"] for row in revision_orders}
+            batch = execute_target_weights(
+                memory=memory,
+                signal_date=revision["signal_date"],
+                execution_date=execution_date,
+                signal_value=signal_value,
+                target_weights=targets,
+                holdings=holdings,
+                cash=cash,
+                tradability_provider=market_config.require("tradability_provider"),
+                cost_model=market_config.require("transaction_cost_model"),
+                lot_size_provider=market_config.require("lot_size_provider"),
+                execution_codes=order_codes,
+            )
+            by_code = {row["instrument"]: row for row in batch.records}
+
+            for order in revision_orders:
                 code = order["ts_code"]
-                bar = memory.prices.get((code, execution_date))
-                reason = None
-                if bar is None or bar.open is None:
-                    reason = "T+1 缺少真实开盘价"
-                elif bar.suspended:
-                    reason = "T+1 停牌不可成交"
-                elif order["side"] == "BUY" and bar.limit_up:
-                    reason = "T+1 涨停不可买入"
-                elif order["side"] == "SELL" and bar.limit_down:
-                    reason = "T+1 跌停不可卖出"
-                if reason:
-                    final_failure = bar is not None and bar.open is not None and (bar.suspended or (order["side"] == "BUY" and bar.limit_up) or (order["side"] == "SELL" and bar.limit_down))
-                    order_status = "FAILED" if final_failure else "PENDING"
-                    store.update_portfolio_order(order["order_id"], planned_trade_date=execution_date, status=order_status, reason=reason)
-                    summary["failed_orders" if final_failure else "pending_orders"] += 1
-                    continue
-                execution_price = float(bar.adjusted_open)
-                current_quantity = float((holding_map.get(code) or {}).get("quantity") or 0.0)
-                desired_quantity = max(0.0, int((signal_value * float(order["target_weight"])) / execution_price / 100) * 100.0)
-                delta = desired_quantity - current_quantity
-                side = "BUY" if delta > 0 else "SELL"
-                desired_trade_quantity = abs(delta)
-                if desired_trade_quantity < 1e-9:
-                    store.update_portfolio_order(order["order_id"], side=side, target_quantity=desired_quantity, remaining_quantity=0.0, planned_trade_date=execution_date, status="COMPLETED", reason="目标数量无需调整")
+                record = by_code.get(code)
+                target_quantity = float(batch.target_quantities.get(code, holdings.get(code, 0.0)))
+                if record is None:
+                    store.update_portfolio_order(
+                        order["order_id"],
+                        target_quantity=target_quantity,
+                        remaining_quantity=0.0,
+                        planned_trade_date=execution_date,
+                        status="COMPLETED",
+                        reason="目标数量无需调整",
+                    )
                     summary["completed_orders"] += 1
                     continue
-                fee_bps = float(portfolio["transaction_cost_bps"])
-                trade_quantity = desired_trade_quantity
-                if side == "BUY":
-                    affordable = int((cash / (execution_price * (1 + fee_bps / 10_000))) / 100) * 100.0
-                    trade_quantity = min(desired_trade_quantity, affordable)
-                else:
-                    trade_quantity = min(desired_trade_quantity, current_quantity)
-                if trade_quantity <= 0:
-                    store.update_portfolio_order(order["order_id"], side=side, target_quantity=desired_quantity, remaining_quantity=desired_trade_quantity, planned_trade_date=execution_date, status="PARTIAL", reason="可用现金或持仓不足")
+
+                executed = float(record.get("executed_quantity") or 0.0)
+                remaining = float(record.get("remaining_quantity") or 0.0)
+                reason = record.get("reason")
+                if executed > 0:
+                    cost_audit = record.get("cost_audit") or {}
+                    store.record_portfolio_trade({
+                        "order_id": order["order_id"],
+                        "portfolio_id": pid,
+                        "revision_id": revision_id,
+                        "ts_code": code,
+                        "trade_date": execution_date,
+                        "side": record["side"],
+                        "quantity": executed,
+                        "price": float(memory.prices[(code, execution_date)].adjusted_open),
+                        "gross_amount": float(record["gross_amount"]),
+                        "fee_bps": float(cost_audit.get("cost_bps", fee_bps)),
+                        "fee_amount": float(record.get("fee_amount") or 0.0),
+                    })
+
+                if reason in {"suspended", "limit_up", "limit_down", "st", "new_listing"}:
+                    status = "FAILED"
+                    summary["failed_orders"] += 1
+                elif reason in {"missing_open", "missing_price", "unknown_security"}:
+                    status = "PENDING"
+                    summary["pending_orders"] += 1
+                elif remaining > 1e-9 or reason == "insufficient_cash_or_position":
+                    status = "PARTIAL"
                     summary["partial_orders"] += 1
-                    continue
-                gross = trade_quantity * execution_price
-                fee = gross * fee_bps / 10_000
-                store.record_portfolio_trade({
-                    "order_id": order["order_id"],
-                    "portfolio_id": pid,
-                    "revision_id": revision_id,
-                    "ts_code": code,
-                    "trade_date": execution_date,
-                    "side": side,
-                    "quantity": trade_quantity,
-                    "price": execution_price,
-                    "gross_amount": gross,
-                    "fee_bps": fee_bps,
-                    "fee_amount": fee,
-                })
-                cash += gross - fee if side == "SELL" else -gross - fee
-                trades = store.list_portfolio_trades(pid)
-                holding_map = {row["ts_code"]: row for row in project_holdings(trades)}
-                remaining = max(0.0, desired_trade_quantity - trade_quantity)
-                status = "COMPLETED" if remaining <= 1e-9 else "PARTIAL"
-                store.update_portfolio_order(order["order_id"], side=side, target_quantity=desired_quantity, remaining_quantity=remaining, planned_trade_date=execution_date, status=status, reason=None if status == "COMPLETED" else "可用现金或持仓不足")
-                summary["completed_orders" if status == "COMPLETED" else "partial_orders"] += 1
+                else:
+                    status = "COMPLETED"
+                    summary["completed_orders"] += 1
+
+                store.update_portfolio_order(
+                    order["order_id"],
+                    side=record["side"],
+                    target_quantity=target_quantity,
+                    remaining_quantity=remaining,
+                    planned_trade_date=execution_date,
+                    status=status,
+                    reason=reason_text.get(reason, reason),
+                )
+
             statuses = {row["status"] for row in store.list_portfolio_orders(pid, revision_id)}
-            revision_status = "COMPLETED" if statuses <= {"COMPLETED"} else "FAILED" if statuses <= {"FAILED"} else "PARTIAL" if statuses & {"COMPLETED", "PARTIAL", "FAILED"} else "PENDING"
+            revision_status = (
+                "COMPLETED" if statuses <= {"COMPLETED"}
+                else "FAILED" if statuses <= {"FAILED"}
+                else "PARTIAL" if statuses & {"COMPLETED", "PARTIAL", "FAILED"}
+                else "PENDING"
+            )
             store.update_portfolio_revision_status(revision_id, revision_status)
     return summary
-
 
 def rebuild_portfolio_nav(store, portfolio_id: str) -> dict:
     """Rebuild daily close valuations without carrying stale prices forward."""
