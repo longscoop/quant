@@ -45,6 +45,19 @@ def _growth(current, previous):
     return _ratio(current - previous, previous) if _finite(current) and _finite(previous) else None
 
 
+def _max_drawdown_loss(values) -> float | None:
+    """Return maximum drawdown as a non-negative loss magnitude."""
+    finite_values = [float(value) for value in values if _finite(value) and float(value) > 0]
+    if not finite_values:
+        return None
+    peak = finite_values[0]
+    max_loss = 0.0
+    for value in finite_values:
+        peak = max(peak, value)
+        max_loss = max(max_loss, 1.0 - value / peak)
+    return max_loss
+
+
 def _returns(prices, benchmark, window):
     if len(prices) <= window:
         return None
@@ -101,10 +114,7 @@ def _metrics(memory, codes, as_of, benchmark_id):
             raw[code]["r_volatility"] = pstdev(returns[-60:]) * sqrt(252)
         if len(prices) >= 252:
             series = [bar.adjusted_close for bar in prices[-252:]]
-            peak, drawdown = series[0], 0.0
-            for value in series:
-                peak = max(peak, value); drawdown = min(drawdown, value / peak - 1)
-            raw[code]["r_drawdown"] = drawdown
+            raw[code]["r_drawdown"] = _max_drawdown_loss(series)
         if valuation:
             raw[code]["r_liquidity"] = valuation.turnover_rate
         raw[code]["r_financial"] = 0.0 if current and any(value is not None and value < 0 for value in (current.net_profit, current.operating_cashflow)) else 1.0 if current else None
