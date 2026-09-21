@@ -16,6 +16,7 @@ DEFAULT_FACTOR_DIMENSIONS = (
     "momentum",
     "low_volatility",
     "liquidity",
+    "industry",
 )
 
 

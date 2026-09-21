@@ -136,7 +136,7 @@ class CnPITFeatureProvider(PITFeatureProvider):
                     **{
                         name: value
                         for name, value in ranking.get("metrics", {}).items()
-                        if name.startswith(("q_", "g_", "v_", "m_", "r_"))
+                        if name.startswith(("q_", "g_", "v_", "m_", "r_", "l_", "i_"))
                     },
                 })
         return pd.DataFrame(rows)
@@ -202,29 +202,76 @@ class CnTradabilityProvider(TradabilityProvider):
 
 
 class CnTransactionCostModel(TransactionCostModel):
-    def __init__(self, cost_bps: float):
-        if cost_bps < 0:
-            raise ValueError("cost_bps must be non-negative")
-        self.cost_bps = float(cost_bps)
+    def __init__(
+        self,
+        cost_bps: float | None = None,
+        *,
+        buy_commission_bps: float | None = None,
+        sell_commission_bps: float | None = None,
+        sell_tax_bps: float = 0.0,
+        minimum_commission: float = 0.0,
+        slippage_bps: float = 0.0,
+    ):
+        fallback = 0.0 if cost_bps is None else float(cost_bps)
+        self.buy_commission_bps = fallback if buy_commission_bps is None else float(buy_commission_bps)
+        self.sell_commission_bps = fallback if sell_commission_bps is None else float(sell_commission_bps)
+        self.sell_tax_bps = float(sell_tax_bps)
+        self.minimum_commission = float(minimum_commission)
+        self.slippage_bps = float(slippage_bps)
+        for name, value in (
+            ("buy_commission_bps", self.buy_commission_bps),
+            ("sell_commission_bps", self.sell_commission_bps),
+            ("sell_tax_bps", self.sell_tax_bps),
+            ("minimum_commission", self.minimum_commission),
+            ("slippage_bps", self.slippage_bps),
+        ):
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative")
+        self.cost_bps = fallback
 
     def calculate(self, order: Order, portfolio_state: PortfolioState) -> TransactionCost:
         del portfolio_state
+        side = order.side.upper()
+        if side not in {"BUY", "SELL"}:
+            raise ValueError(f"unsupported order side: {order.side}")
         gross_amount = abs(float(order.quantity) * float(order.price))
-        amount = gross_amount * self.cost_bps / 10_000
+        commission_bps = self.buy_commission_bps if side == "BUY" else self.sell_commission_bps
+        commission = max(
+            self.minimum_commission,
+            gross_amount * commission_bps / 10_000,
+        ) if gross_amount > 0 else 0.0
+        sell_tax = gross_amount * self.sell_tax_bps / 10_000 if side == "SELL" else 0.0
+        slippage = gross_amount * self.slippage_bps / 10_000
+        amount = commission + sell_tax + slippage
         return TransactionCost(
             amount=amount,
             audit={
                 "market_id": "CN",
-                "side": order.side.upper(),
-                "cost_bps": self.cost_bps,
-                "sell_tax_bps": 0.0,
-                "minimum_fee": 0.0,
+                "side": side,
+                "cost_bps": commission_bps,
+                "buy_commission_bps": self.buy_commission_bps,
+                "sell_commission_bps": self.sell_commission_bps,
+                "sell_tax_bps": self.sell_tax_bps,
+                "minimum_commission": self.minimum_commission,
+                "slippage_bps": self.slippage_bps,
+                "commission": commission,
+                "sell_tax": sell_tax,
+                "slippage": slippage,
                 "gross_amount": gross_amount,
             },
         )
 
 
-def build_cn_market_config(store, *, cost_bps: float = 5.0) -> MarketConfig:
+def build_cn_market_config(
+    store,
+    *,
+    cost_bps: float = 5.0,
+    buy_commission_bps: float | None = None,
+    sell_commission_bps: float | None = None,
+    sell_tax_bps: float = 0.0,
+    minimum_commission: float = 0.0,
+    slippage_bps: float = 0.0,
+) -> MarketConfig:
     """Build the CN application adapter without registering a process-global fallback."""
     universe_provider = CnUniverseProvider(store) if store is not None else None
     return MarketConfig(
@@ -235,7 +282,14 @@ def build_cn_market_config(store, *, cost_bps: float = 5.0) -> MarketConfig:
         calendar=CnMarketCalendar(store) if store is not None else None,
         universe_provider=universe_provider,
         pit_feature_provider=CnPITFeatureProvider(store, universe_provider) if store is not None else None,
-        transaction_cost_model=CnTransactionCostModel(cost_bps),
+        transaction_cost_model=CnTransactionCostModel(
+            cost_bps,
+            buy_commission_bps=buy_commission_bps,
+            sell_commission_bps=sell_commission_bps,
+            sell_tax_bps=sell_tax_bps,
+            minimum_commission=minimum_commission,
+            slippage_bps=slippage_bps,
+        ),
         tradability_provider=CnTradabilityProvider(store) if store is not None else None,
         lot_size_provider=CnLotSizeProvider(),
     )
