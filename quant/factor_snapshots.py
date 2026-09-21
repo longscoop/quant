@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date
 
+from .factor_diagnostics import cross_section_diagnostics
 from .factors_v1 import build_rankings
 from .markets import MarketConfig, ResearchContext
 from .scoring import FACTOR_MODEL_VERSION, PIT_DATA_VERSION
