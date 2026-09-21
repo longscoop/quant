@@ -568,24 +568,6 @@ class InMemoryStore:
     def get_portfolio_positions(self, portfolio_id: str = "default") -> list[dict]:
         return sorted((dict(row) for (pid, _), row in self.portfolio_positions.items() if pid == portfolio_id), key=lambda row: row["ts_code"])
 
-    def record_factor_run_rows(self, run_id: str, rows) -> int:
-        self.initialize()
-        normalized = list(rows)
-        if not normalized:
-            return 0
-        with self._connect() as conn:
-            for row in normalized:
-                conn.execute(
-                    "INSERT INTO factor_run_items (run_id,as_of_date,ts_code,values) VALUES (%s,%s,%s,%s::jsonb) ON CONFLICT (run_id,as_of_date,ts_code) DO UPDATE SET values=EXCLUDED.values",
-                    (
-                        run_id,
-                        row.as_of_date,
-                        row.ts_code,
-                        json.dumps(sanitize_for_storage(row.values), default=str),
-                    ),
-                )
-        return len(normalized)
-
     def get_factor_snapshot(self, as_of_date, factor_version: str, pit_version: str, universe_version: str, context=None) -> dict | None:
         prefix = (as_of_date, factor_version, pit_version, universe_version)
         if context is not None:
@@ -1026,6 +1008,24 @@ class PostgresStore:
                 ),
             )
         return run_id
+
+    def record_factor_run_rows(self, run_id: str, rows) -> int:
+        self.initialize()
+        normalized = list(rows)
+        if not normalized:
+            return 0
+        with self._connect() as conn:
+            for row in normalized:
+                conn.execute(
+                    "INSERT INTO factor_run_items (run_id,as_of_date,ts_code,values) VALUES (%s,%s,%s,%s::jsonb) ON CONFLICT (run_id,as_of_date,ts_code) DO UPDATE SET values=EXCLUDED.values",
+                    (
+                        run_id,
+                        row.as_of_date,
+                        row.ts_code,
+                        json.dumps(sanitize_for_storage(row.values), default=str),
+                    ),
+                )
+        return len(normalized)
 
     def get_factor_snapshot(self, as_of_date, factor_version: str, pit_version: str, universe_version: str, context=None) -> dict | None:
         self.initialize()

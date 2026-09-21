@@ -232,9 +232,9 @@ class QlibModelWorkflowTest(unittest.TestCase):
         store = Store()
         for code, multiplier in (("000001.SZ", 1.0), ("600000.SH", 1.1)):
             for offset in (0, 1, 20, 21, 50, 70, 90, 110):
-                store.prices[(code, sessions[offset])] = PriceBar(code, sessions[offset], (10 + offset / 10) * multiplier)
+                store.prices[(code, sessions[offset])] = PriceBar(code, sessions[offset], (10 + offset / 10) * multiplier, open=(10 + offset / 10) * multiplier)
         for offset in (0, 1, 20, 21, 50, 70, 90, 110):
-            store.benchmarks[("000300.SH", sessions[offset])] = BenchmarkBar("000300.SH", sessions[offset], 100 + offset / 10)
+            store.benchmarks[("000300.SH", sessions[offset])] = BenchmarkBar("000300.SH", sessions[offset], 100 + offset / 10, 100 + offset / 10)
 
         class Dataset:
             def __init__(self, *, handler, segments):
