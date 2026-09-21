@@ -139,6 +139,30 @@ class PitV1ScoringTests(unittest.TestCase):
 
         self.assertEqual(next_trading_day(date(2026, 8, 15), [date(2026, 8, 14), date(2026, 8, 17)]), date(2026, 8, 17))
 
+    def test_factor_run_uses_external_row_storage_when_repository_supports_it(self):
+        from quant.providers import FixtureProvider
+        from quant.storage import InMemoryStore
+        from quant.workflows import build_factor_run
+
+        class StructuredRunStore(InMemoryStore):
+            def record_run(self, run_type, status, parameters, payload=None, error=None):
+                self.recorded_payload = payload or {}
+                return "run-structured"
+
+            def record_factor_run_rows(self, run_id, rows):
+                self.external_rows = (run_id, list(rows))
+
+        store = StructuredRunStore()
+        store.sync(FixtureProvider())
+
+        run_id = build_factor_run(store, [date(2024, 4, 15)])
+
+        self.assertEqual(run_id, "run-structured")
+        self.assertNotIn("rows", store.recorded_payload)
+        self.assertEqual(store.recorded_payload["row_storage"]["kind"], "factor_run_items")
+        self.assertEqual(store.external_rows[0], "run-structured")
+        self.assertGreater(len(store.external_rows[1]), 0)
+
     def test_factor_run_persists_versioned_transparent_rankings(self):
         from quant.providers import FixtureProvider
         from quant.storage import InMemoryStore
