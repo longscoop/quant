@@ -1,0 +1,40 @@
+Fix round 1 expected files:
+- quant/admin.py
+- tests/test_admin_workbench.py
+
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-1-fix1-before/admin.py	2026-08-28 22:17:25
++++ quant/admin.py	2026-08-28 22:18:19
+@@ -17,13 +17,13 @@
+     "failed": "失败",
+ }
+ _SENSITIVE_VALUE_RE = re.compile(
+-    r"\b(token|password|secret|database_url)\b"
++    r"(?<![A-Za-z0-9])(token|password|secret|database_url)\b"
+     r"(\s*(?:(?:=|:)\s*)|[\t ]+)"
+     r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)",
+     re.IGNORECASE,
+ )
+ _URL_CREDENTIAL_RE = re.compile(
+-    r"\b([a-z][a-z0-9+.-]*://)([^\s/:@]+(?::[^\s/@]*)?)@",
++    r"\b([a-z][a-z0-9+.-]*://)([^\s/@]*)@",
+     re.IGNORECASE,
+ )
+ 
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-1-fix1-before/test_admin_workbench.py	2026-08-28 22:17:25
++++ tests/test_admin_workbench.py	2026-08-28 22:18:06
+@@ -119,6 +119,15 @@
+         self.assertNotIn("abc123", clean)
+         self.assertNotIn("hunter2", clean)
+ 
++    def test_sensitive_text_redacts_tushare_token_environment_name(self):
++        clean = redact_sensitive_text("sync failed TUSHARE_TOKEN=abc123")
++        self.assertNotIn("abc123", clean)
++
++    def test_sensitive_text_redacts_database_url_with_empty_username(self):
++        clean = redact_sensitive_text("connection failed postgresql://:pass@host/db")
++        self.assertNotIn(":pass@", clean)
++        self.assertNotIn("pass", clean)
++
+     def test_retry_parameters_support_factor_and_model_dates_and_references(self):
+         factors = {
+             "run_type": "factors",

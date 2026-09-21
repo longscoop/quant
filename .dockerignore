@@ -1,0 +1,16 @@
+.git/
+.venv/
+.pytest_cache/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.DS_Store
+data/
+frontend/
+tests/
+docs/
+.agents/
+.claude/
+.superpowers/

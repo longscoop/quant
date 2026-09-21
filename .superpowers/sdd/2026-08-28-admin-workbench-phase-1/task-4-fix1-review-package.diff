@@ -1,0 +1,243 @@
+Fix round 1 expected files:
+- quant/admin.py
+- quant/admin_ui.py
+- tests/test_admin_workbench.py
+- tests/fixtures/admin_workbench_app.py
+- docker-compose.yml
+- .env.example
+- README.md
+
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-4-fix1-before/admin.py	2026-08-29 10:08:33
++++ quant/admin.py	2026-08-29 10:10:35
+@@ -2,12 +2,14 @@
+ 
+ from __future__ import annotations
+ 
+-from datetime import date, datetime
++from datetime import date, datetime, timedelta
+ import re
++from collections.abc import Callable
+ 
+ 
+ TRUTHY = {"1", "true", "yes", "on"}
+ TASK_ORDER = ("sync", "quality", "factors", "model")
++FRESHNESS_LOOKBACK_DAYS = 32
+ PUBLIC_NAVIGATION_PAGES = (
+     "今日机会",
+     "股票池",
+@@ -62,13 +64,37 @@
+     return ("研究数据正在准备", "当前暂时无法加载研究数据。", "请稍后刷新页面。")
+ 
+ 
++def data_is_stale(
++    latest_trade_date: date | None,
++    *,
++    today: date,
++    is_trade_day: Callable[[date], bool],
++) -> bool:
++    """Return whether an expected completed trade day is missing from the latest data.
++
++    The check excludes ``today`` because the current session may not have
++    completed.  It calls the persisted-calendar predicate for at most 31
++    calendar dates; gaps longer than 32 days are immediately stale.
++    """
++    if latest_trade_date is None or today <= latest_trade_date + timedelta(days=1):
++        return False
++    if today - latest_trade_date > timedelta(days=FRESHNESS_LOOKBACK_DAYS):
++        return True
++    candidate = latest_trade_date + timedelta(days=1)
++    while candidate < today:
++        if is_trade_day(candidate):
++            return True
++        candidate += timedelta(days=1)
++    return False
++
++
+ def pipeline_steps(runs: list[dict], quality: dict) -> list[dict]:
+     """Project stored runs and data quality into the ordered admin pipeline."""
+     latest = {
+         run_type: next((run for run in runs if run.get("run_type") == run_type), None)
+         for run_type in ("sync", "factors", "model")
+     }
+-    data_ready = bool(quality.get("is_complete"))
++    data_ready = bool(quality.get("is_complete")) and not bool(quality.get("is_stale"))
+     factor_ready = bool(latest["factors"] and latest["factors"].get("status") == "completed")
+     running = {
+         run_type
+@@ -146,9 +172,14 @@
+ 
+ def _quality_step(quality: dict) -> dict:
+     complete = bool(quality.get("is_complete"))
++    stale = bool(quality.get("is_stale"))
+     missing_prices = quality.get("missing_latest_price_codes") or []
+     missing_financials = quality.get("missing_financial_codes") or []
+-    if complete:
++    if stale:
++        summary = "最新交易日已过期，需要重新同步。"
++        next_step = "请重新同步数据后再执行完整性检查。"
++        state = "需要处理"
++    elif complete:
+         summary = "行情、财务和估值数据完整。"
+         next_step = "可以构建研究因子。"
+         state = "已完成"
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-4-fix1-before/admin_ui.py	2026-08-29 10:08:33
++++ quant/admin_ui.py	2026-08-29 10:10:35
+@@ -7,7 +7,7 @@
+ 
+ import pandas as pd
+ 
+-from .admin import filter_admin_runs, pipeline_steps, redact_sensitive_text, retry_parameters
++from .admin import data_is_stale, filter_admin_runs, pipeline_steps, redact_sensitive_text, retry_parameters
+ from .workflows import build_factor_run, sync_hs300, train_model_run
+ 
+ 
+@@ -21,7 +21,12 @@
+ 
+     if hasattr(store, "fail_stale_sync_runs"):
+         store.fail_stale_sync_runs()
+-    quality = store.data_quality("hs300")
++    quality = dict(store.data_quality("hs300"))
++    quality["is_stale"] = data_is_stale(
++        quality.get("latest_trade_date"),
++        today=date.today(),
++        is_trade_day=store.is_trade_day,
++    )
+     counts = store.fast_counts()
+     runs = store.list_runs(200)
+ 
+@@ -62,7 +67,9 @@
+ 
+ 
+ def _render_quality_details(st, quality: dict) -> None:
+-    if quality.get("is_complete"):
++    if quality.get("is_stale"):
++        st.warning("数据日期已过期；请先重新同步并完成完整性检查。")
++    elif quality.get("is_complete"):
+         st.success("数据完整性检查已通过。")
+     else:
+         st.warning("数据尚未完整；请先同步并处理缺口。")
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-4-fix1-before/test_admin_workbench.py	2026-08-29 10:08:33
++++ tests/test_admin_workbench.py	2026-08-29 10:10:47
+@@ -6,6 +6,7 @@
+ 
+ from streamlit.testing.v1 import AppTest
+ 
++import quant.admin as admin
+ from quant.admin import (
+     admin_mode_enabled,
+     database_unavailable_copy,
+@@ -173,7 +174,74 @@
+         self.assertEqual(factors["state"], "待执行")
+         self.assertFalse(factors["can_run"])
+         self.assertIn("完整性", factors["next_step"])
++
++    def test_freshness_contract_marks_all_covered_data_stale_after_expected_trade_day(self):
++        """Ignoring a completed trade day after the latest price would permit stale factor work."""
++        freshness = getattr(admin, "data_is_stale", None)
++        self.assertIsNotNone(freshness, "admin freshness contract must be public and pure")
++        if freshness is None:
++            return
++        self.assertTrue(
++            freshness(
++                date(2026, 8, 27),
++                today=date(2026, 8, 29),
++                is_trade_day=lambda day: day == date(2026, 8, 28),
++            )
++        )
++
++    def test_freshness_contract_keeps_fresh_prior_session_when_calendar_has_no_completed_day(self):
++        """A prior session must not be called stale when the calendar reports no completed day."""
++        freshness = getattr(admin, "data_is_stale", None)
++        self.assertIsNotNone(freshness, "admin freshness contract must be public and pure")
++        if freshness is None:
++            return
++        self.assertFalse(
++            freshness(
++                date(2026, 8, 27),
++                today=date(2026, 8, 29),
++                is_trade_day=lambda day: False,
++            )
++        )
++
++    def test_pipeline_requires_resync_before_factors_when_all_coverage_is_stale(self):
++        """Treating all-covered but stale data as complete would enable an invalid factor build."""
++        quality = {
++            "security_count": 300,
++            "latest_trade_date": date(2026, 8, 27),
++            "missing_latest_price_codes": [],
++            "missing_financial_codes": [],
++            "valuation_count": 300,
++            "is_complete": True,
++            "is_stale": True,
++        }
++        rows = pipeline_steps([], quality)
++        quality_row = next(row for row in rows if row["id"] == "quality")
++        factors = next(row for row in rows if row["id"] == "factors")
++        self.assertEqual(quality_row["state"], "需要处理")
++        self.assertIn("重新同步", quality_row["summary"])
++        self.assertIn("重新同步", quality_row["next_step"])
++        self.assertFalse(factors["can_run"])
+ 
++    def test_admin_renderer_blocks_factors_for_all_covered_stale_data(self):
++        """Dropping the UI freshness projection would re-enable factors for old but covered data."""
++        at = self._admin_app("stale")
++
++        self.assertEqual(len(at.exception), 0)
++        self.assertTrue(at.button(key="admin_factors_submit").disabled)
++        rendered = "\n".join(
++            str(element.value)
++            for elements in (at.subheader, at.markdown, at.caption)
++            for element in elements
++        )
++        self.assertIn("重新同步", rendered)
++
++    def test_admin_renderer_allows_factors_for_fresh_prior_session(self):
++        """A no-trade-day prior session must not become a false stale-data lockout."""
++        at = self._admin_app("enabled")
++
++        self.assertEqual(len(at.exception), 0)
++        self.assertFalse(at.button(key="admin_factors_submit").disabled)
++
+     def test_completed_factor_run_unlocks_model_generation(self):
+         quality = {
+             "security_count": 300,
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-4-fix1-before/admin_workbench_app.py	2026-08-29 10:08:33
++++ tests/fixtures/admin_workbench_app.py	2026-08-29 10:10:35
+@@ -78,6 +78,9 @@
+     def fail_stale_sync_runs(self):
+         return 0
+ 
++    def is_trade_day(self, day):
++        return MODE == "stale" and day.weekday() < 5
++
+     def list_runs(self, limit=100):
+         return self.runs[:limit]
+ 
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-4-fix1-before/docker-compose.yml	2026-08-29 10:08:33
++++ docker-compose.yml	2026-08-29 10:11:20
+@@ -13,6 +13,7 @@
+     environment:
+       DATABASE_URL: postgresql+psycopg://quant:${POSTGRES_PASSWORD:-quant}@postgres:5432/quant
+       TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
++      QUANT_ADMIN_MODE: ${QUANT_ADMIN_MODE:-}
+     ports: ["8501:8501"]
+     depends_on: [postgres]
+   quant:
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-4-fix1-before/.env.example	2026-08-29 10:08:33
++++ .env.example	2026-08-29 10:11:20
+@@ -1,3 +1,4 @@
+ TUSHARE_TOKEN=
++QUANT_ADMIN_MODE=
+ POSTGRES_PASSWORD=quant
+ DATABASE_URL=postgresql://quant:quant@localhost:5432/quant
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-4-fix1-before/README.md	2026-08-29 10:08:33
++++ README.md	2026-08-29 10:11:20
+@@ -29,7 +29,7 @@
+ 
+ ```bash
+ cp .env.example .env
+-# 在 .env 填写 TUSHARE_TOKEN，并按需修改 POSTGRES_PASSWORD
++# 仅内部管理员实例：在 .env 填写 TUSHARE_TOKEN、QUANT_ADMIN_MODE=1，并按需修改 POSTGRES_PASSWORD
+ docker compose up --build
+ ```
+ 

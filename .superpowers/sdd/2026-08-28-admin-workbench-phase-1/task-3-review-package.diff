@@ -1,0 +1,331 @@
+Expected task files:
+- streamlit_app.py
+- quant/admin.py
+- tests/test_quant_mvp.py
+- tests/test_admin_workbench.py
+- optional public status renderer/fixture
+
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-3-before/streamlit_app.py	2026-08-29 09:40:52
++++ streamlit_app.py	2026-08-29 09:44:51
+@@ -7,6 +7,8 @@
+ import plotly.graph_objects as go
+ import streamlit as st
+ 
++from quant.admin import admin_mode_enabled, database_unavailable_copy, navigation_pages
++from quant.admin_ui import render_admin_workbench
+ from quant.insights import (
+     data_quality_summary,
+     filter_candidate_rows,
+@@ -21,6 +23,7 @@
+     run_status_summary,
+ )
+ from quant.presentation import format_metric, sanitize_display_rows, sanitize_display_value, status_feedback
++from quant.public_status_ui import render_public_data_status
+ from quant.storage import PostgresStore
+ from quant.ui import empty_state, inject_workspace_css, metric_cards, page_header, research_disclaimer, security_option_label, status_badge
+ from quant.workflows import build_factor_run, run_backtest_run, run_portfolio_backtest_run, sync_hs300, train_model_run
+@@ -729,34 +732,9 @@
+ 
+ def render_data_status(store):
+     memory = page_memory(store, price_days=2)
+-    page_header(st, "数据状态", "确认数据新鲜度、覆盖范围和研究运行状态。")
+     quality = data_quality_summary(memory)
+     counts = store.fast_counts()
+-    metric_cards(st, [("最新行情", str(quality["latest_trade_date"] or "不可用"), "交易日"), ("证券", str(counts.get("securities", 0)), "当前研究范围"), ("行情记录", str(counts.get("prices", 0)), "price_bars"), ("财务记录", str(counts.get("financials", 0)), "已披露记录"), ("估值记录", str(counts.get("valuation_count", 0)), "daily_basic")])
+-    runs = store.list_runs()
+-    if runs:
+-        st.markdown("### 研究状态")
+-        state_rows = []
+-        for run_type, label in (("sync", "数据同步"), ("factors", "因子构建"), ("model", "模型预测"), ("backtest", "回测验证")):
+-            run = next((item for item in runs if item["run_type"] == run_type), None)
+-            if not run:
+-                state_rows.append({"阶段": label, "状态": "待执行", "运行 ID": "—"})
+-            else:
+-                status = run["status"]
+-                label_status = "已完成" if status == "completed" else "不可训练" if status == "not_trainable" else "失败" if status == "failed" else "进行中"
+-                state_rows.append({"阶段": label, "状态": label_status, "运行 ID": run["run_id"]})
+-        st.dataframe(frame(state_rows), hide_index=True, use_container_width=True)
+-    with st.expander("数据同步", expanded=False):
+-        render_data_management(store)
+-    with st.expander("因子与模型运行", expanded=False):
+-        render_factor_research(store)
+-        st.divider()
+-        render_model_training(store)
+-    with st.expander("运行记录与同步审计"):
+-        render_run_records(store)
+-    with st.expander("研究流程说明"):
+-        st.markdown("1. 同步沪深300数据。\n2. 构建覆盖目标日期的因子。\n3. 训练模型并生成研究信号。\n4. 使用真实模型结果进行历史回测。")
+-    research_disclaimer(st)
++    render_public_data_status(st, quality, counts, store.list_runs())
+ 
+ 
+ @st.cache_resource(show_spinner=False)
+@@ -767,23 +745,25 @@
+ inject_workspace_css(st)
+ st.sidebar.markdown("### 量化研究工作台")
+ st.sidebar.caption("沪深300 · 研究信号")
++admin_mode = admin_mode_enabled(os.getenv("QUANT_ADMIN_MODE"))
++pages = navigation_pages(admin_mode)
++page = st.sidebar.radio("研究模块", pages, index=0)
+ dsn = os.getenv("DATABASE_URL", "")
+ if not dsn:
++    title, detail, next_step = database_unavailable_copy(admin_mode)
+     page_header(st, "量化研究工作台", "配置数据连接后开始研究。")
+-    empty_state(st, "尚未连接研究数据库", "页面只读取 PostgreSQL 中已经同步的数据，不会在刷新时自动请求外部接口。", "请在部署环境配置 DATABASE_URL；连接方式见 README。")
+-    with st.expander("高级数据连接设置"):
+-        st.caption("当前部署未提供 DATABASE_URL。请通过 Docker Compose 或运行环境变量配置连接串，避免在页面中保存凭据。")
++    empty_state(st, title, detail, next_step)
+     research_disclaimer(st)
+     st.stop()
+ try:
+     store = repository(dsn)
+     store.initialize()
+-except Exception as exc:
+-    st.error(f"数据库不可用：{exc}")
++except Exception:
++    title, detail, next_step = database_unavailable_copy(admin_mode)
++    empty_state(st, title, detail, next_step)
++    research_disclaimer(st)
+     st.stop()
+ 
+-page = st.sidebar.radio("研究模块", ["今日机会", "股票池", "个股研究", "行业景气", "策略实验室", "组合", "回测", "数据状态"], index=0)
+-
+ if page == "今日机会":
+     render_today_opportunities(store)
+ elif page == "股票池":
+@@ -798,5 +778,7 @@
+     render_portfolio(store)
+ elif page == "回测":
+     render_backtest_results(store)
++elif page == "管理员":
++    render_admin_workbench(st, store)
+ else:
+     render_data_status(store)
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-3-before/admin.py	2026-08-29 09:40:52
++++ quant/admin.py	2026-08-29 09:43:44
+@@ -8,6 +8,16 @@
+ 
+ TRUTHY = {"1", "true", "yes", "on"}
+ TASK_ORDER = ("sync", "quality", "factors", "model")
++PUBLIC_NAVIGATION_PAGES = (
++    "今日机会",
++    "股票池",
++    "个股研究",
++    "行业景气",
++    "策略实验室",
++    "组合",
++    "回测",
++    "数据状态",
++)
+ 
+ _STATE_LABELS = {
+     "running": "进行中",
+@@ -33,6 +43,25 @@
+     return str(value or "").strip().lower() in TRUTHY
+ 
+ 
++def navigation_pages(admin_mode: bool) -> list[str]:
++    """Return the deployment-appropriate research navigation labels."""
++    pages = list(PUBLIC_NAVIGATION_PAGES)
++    if admin_mode:
++        pages.append("管理员")
++    return pages
++
++
++def database_unavailable_copy(admin_mode: bool) -> tuple[str, str, str]:
++    """Return audience-safe copy for an unavailable research database."""
++    if admin_mode:
++        return (
++            "尚未连接研究数据库",
++            "管理员部署尚未提供研究数据库。",
++            "请在部署环境配置 DATABASE_URL。",
++        )
++    return ("研究数据正在准备", "当前暂时无法加载研究数据。", "请稍后刷新页面。")
++
++
+ def pipeline_steps(runs: list[dict], quality: dict) -> list[dict]:
+     """Project stored runs and data quality into the ordered admin pipeline."""
+     latest = {
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-3-before/test_quant_mvp.py	2026-08-29 09:40:52
++++ tests/test_quant_mvp.py	2026-08-29 09:45:22
+@@ -1,10 +1,13 @@
+ import unittest
+ from datetime import date
++import os
+ from pathlib import Path
+ import subprocess
+ import sys
+ from unittest.mock import patch
+ 
++from streamlit.testing.v1 import AppTest
++
+ from quant.backtest import BacktestConfig, run_backtest
+ from quant.factors import FactorEngine
+ from quant.model import ModelTrainer, export_qlib
+@@ -94,6 +97,42 @@
+         result = subprocess.run([sys.executable, "-m", "py_compile", "streamlit_app.py"], capture_output=True, text=True)
+         self.assertEqual(result.returncode, 0, result.stderr)
+ 
++    def test_streamlit_entrypoint_gates_navigation_and_database_copy_by_audience(self):
++        """The no-database entrypoint keeps public output operationally safe."""
++        def run_entrypoint(admin_mode: str):
++            with patch.dict(
++                os.environ,
++                {"QUANT_ADMIN_MODE": admin_mode},
++                clear=True,
++            ):
++                return AppTest.from_file(str(Path(__file__).parents[1] / "streamlit_app.py")).run(timeout=10)
++
++        public = run_entrypoint("false")
++        self.assertEqual(len(public.exception), 0)
++        self.assertEqual(
++            public.sidebar.radio[0].options,
++            ["今日机会", "股票池", "个股研究", "行业景气", "策略实验室", "组合", "回测", "数据状态"],
++        )
++        public_output = "\n".join(
++            str(element.value) for elements in (public.markdown, public.caption) for element in elements
++        )
++        self.assertIn("研究数据正在准备", public_output)
++        self.assertIn("请稍后刷新页面。", public_output)
++        for forbidden in ("DATABASE_URL", "PostgreSQL", "Tushare Token", "管理员"):
++            self.assertNotIn(forbidden, public_output)
++
++        admin = run_entrypoint("true")
++        self.assertEqual(len(admin.exception), 0)
++        self.assertEqual(
++            admin.sidebar.radio[0].options,
++            ["今日机会", "股票池", "个股研究", "行业景气", "策略实验室", "组合", "回测", "数据状态", "管理员"],
++        )
++        admin_output = "\n".join(
++            str(element.value) for elements in (admin.markdown, admin.caption) for element in elements
++        )
++        self.assertIn("尚未连接研究数据库", admin_output)
++        self.assertIn("请在部署环境配置 DATABASE_URL。", admin_output)
++
+     def test_streamlit_app_uses_research_summary_helpers(self):
+         source = Path("streamlit_app.py").read_text(encoding="utf-8")
+         self.assertIn("data_quality_summary", source)
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-3-before/test_admin_workbench.py	2026-08-29 09:40:52
++++ tests/test_admin_workbench.py	2026-08-29 09:45:22
+@@ -8,7 +8,9 @@
+ 
+ from quant.admin import (
+     admin_mode_enabled,
++    database_unavailable_copy,
+     filter_admin_runs,
++    navigation_pages,
+     pipeline_steps,
+     redact_sensitive_text,
+     retry_parameters,
+@@ -16,6 +18,44 @@
+ 
+ 
+ class AdminWorkbenchTests(unittest.TestCase):
++    def test_navigation_pages_and_database_copy_are_audience_specific(self):
++        """A public deployment must not expose the administrator route or setup details."""
++        public_pages = ["今日机会", "股票池", "个股研究", "行业景气", "策略实验室", "组合", "回测", "数据状态"]
++        self.assertEqual(navigation_pages(False), public_pages)
++        self.assertEqual(navigation_pages(True), [*public_pages, "管理员"])
++        self.assertEqual(
++            database_unavailable_copy(False),
++            ("研究数据正在准备", "当前暂时无法加载研究数据。", "请稍后刷新页面。"),
++        )
++        self.assertEqual(
++            database_unavailable_copy(True),
++            ("尚未连接研究数据库", "管理员部署尚未提供研究数据库。", "请在部署环境配置 DATABASE_URL。"),
++        )
++
++    def test_public_data_status_renders_stages_without_management_controls_or_run_ids(self):
++        """Public data status must remain a read-only progress view."""
++        app_file = Path(__file__).parent / "fixtures" / "public_status_app.py"
++        at = AppTest.from_file(str(app_file)).run(timeout=10)
++
++        self.assertEqual(len(at.exception), 0)
++        self.assertEqual(len(at.button), 0)
++        rendered = "\n".join(
++            str(element.value)
++            for elements in (at.markdown, at.caption, at.subheader, at.dataframe)
++            for element in elements
++        )
++        for forbidden in (
++            "run-secret-123",
++            "运行 ID",
++            "开始同步",
++            "构建研究因子",
++            "生成研究模型",
++            "Tushare Token",
++            "DATABASE_URL",
++            "PostgreSQL",
++        ):
++            self.assertNotIn(forbidden, rendered)
++
+     def _admin_app(self, mode="guarded", token=None):
+         app_file = Path(__file__).parent / "fixtures" / "admin_workbench_app.py"
+         environment = {"ADMIN_FIXTURE_MODE": mode}
+--- /dev/null	2026-08-29 09:47:20
++++ quant/public_status_ui.py	2026-08-29 09:44:14
+@@ -0,0 +1,47 @@
++"""Read-only public research data status renderer."""
++
++from __future__ import annotations
++
++import pandas as pd
++
++from .ui import metric_cards, page_header, research_disclaimer
++
++
++_STAGES = (
++    ("sync", "数据同步"),
++    ("factors", "因子构建"),
++    ("model", "模型预测"),
++    ("backtest", "回测验证"),
++)
++_STATUS_LABELS = {
++    "completed": "已完成",
++    "not_trainable": "不可训练",
++    "failed": "失败",
++    "running": "进行中",
++}
++
++
++def render_public_data_status(st, quality: dict, counts: dict, runs: list[dict]) -> None:
++    """Render freshness and user-facing workflow stages without operational controls."""
++    page_header(st, "数据状态", "确认数据新鲜度、覆盖范围和研究运行状态。")
++    metric_cards(
++        st,
++        [
++            ("最新行情", str(quality.get("latest_trade_date") or "不可用"), "交易日"),
++            ("证券", str(counts.get("securities", 0)), "当前研究范围"),
++            ("行情记录", str(counts.get("prices", 0)), "price_bars"),
++            ("财务记录", str(counts.get("financials", 0)), "已披露记录"),
++            ("估值记录", str(counts.get("valuation_count", 0)), "daily_basic"),
++        ],
++    )
++    st.subheader("研究状态")
++    latest_runs = {run.get("run_type"): run for run in runs}
++    rows = [
++        {
++            "阶段": label,
++            "状态": _STATUS_LABELS.get((latest_runs.get(run_type) or {}).get("status"), "待执行"),
++        }
++        for run_type, label in _STAGES
++    ]
++    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
++    research_disclaimer(st)
+--- /dev/null	2026-08-29 09:47:20
++++ tests/fixtures/public_status_app.py	2026-08-29 09:43:14
+@@ -0,0 +1,14 @@
++import streamlit as st
++
++from quant.public_status_ui import render_public_data_status
++
++
++render_public_data_status(
++    st,
++    quality={"latest_trade_date": "2026-08-27"},
++    counts={"securities": 300, "prices": 600, "financials": 300, "valuation_count": 300},
++    runs=[
++        {"run_id": "run-secret-123", "run_type": "sync", "status": "completed"},
++        {"run_id": "run-secret-456", "run_type": "factors", "status": "running"},
++    ],
++)

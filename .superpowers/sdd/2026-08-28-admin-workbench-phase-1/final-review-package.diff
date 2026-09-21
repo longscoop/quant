@@ -1,0 +1,1812 @@
+Administrator Phase 1 whole-change filesystem diff
+Expected implementation files:
+- quant/admin.py
+- quant/admin_ui.py
+- quant/public_status_ui.py
+- quant/presentation.py
+- streamlit_app.py
+- tests/test_admin_workbench.py
+- tests/test_quant_mvp.py
+- tests/fixtures/admin_workbench_app.py
+- tests/fixtures/public_status_app.py
+- README.md
+- docker-compose.yml
+- .env.example
+
+--- /dev/null	2026-08-29 10:41:56
++++ quant/admin.py	2026-08-29 10:10:35
+@@ -0,0 +1,278 @@
++"""Pure projections for the administrator workbench."""
++
++from __future__ import annotations
++
++from datetime import date, datetime, timedelta
++import re
++from collections.abc import Callable
++
++
++TRUTHY = {"1", "true", "yes", "on"}
++TASK_ORDER = ("sync", "quality", "factors", "model")
++FRESHNESS_LOOKBACK_DAYS = 32
++PUBLIC_NAVIGATION_PAGES = (
++    "今日机会",
++    "股票池",
++    "个股研究",
++    "行业景气",
++    "策略实验室",
++    "组合",
++    "回测",
++    "数据状态",
++)
++
++_STATE_LABELS = {
++    "running": "进行中",
++    "completed": "已完成",
++    "not_trainable": "需要处理",
++    "partial": "需要处理",
++    "failed": "失败",
++}
++_SENSITIVE_VALUE_RE = re.compile(
++    r"(?<![A-Za-z0-9])(token|password|secret|dsn|database_dsn|database_url)\b"
++    r"(\s*(?:(?:=|:)\s*)|[\t ]+)"
++    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)",
++    re.IGNORECASE,
++)
++_URL_CREDENTIAL_RE = re.compile(
++    r"\b([a-z][a-z0-9+.-]*://)([^\s/@]*)@",
++    re.IGNORECASE,
++)
++
++
++def admin_mode_enabled(value: str | None) -> bool:
++    """Return whether the deployment explicitly enables administrator mode."""
++    return str(value or "").strip().lower() in TRUTHY
++
++
++def navigation_pages(admin_mode: bool) -> list[str]:
++    """Return the deployment-appropriate research navigation labels."""
++    pages = list(PUBLIC_NAVIGATION_PAGES)
++    if admin_mode:
++        pages.append("管理员")
++    return pages
++
++
++def database_unavailable_copy(admin_mode: bool) -> tuple[str, str, str]:
++    """Return audience-safe copy for an unavailable research database."""
++    if admin_mode:
++        return (
++            "尚未连接研究数据库",
++            "管理员部署尚未提供研究数据库。",
++            "请在部署环境配置 DATABASE_URL。",
++        )
++    return ("研究数据正在准备", "当前暂时无法加载研究数据。", "请稍后刷新页面。")
++
++
++def data_is_stale(
++    latest_trade_date: date | None,
++    *,
++    today: date,
++    is_trade_day: Callable[[date], bool],
++) -> bool:
++    """Return whether an expected completed trade day is missing from the latest data.
++
++    The check excludes ``today`` because the current session may not have
++    completed.  It calls the persisted-calendar predicate for at most 31
++    calendar dates; gaps longer than 32 days are immediately stale.
++    """
++    if latest_trade_date is None or today <= latest_trade_date + timedelta(days=1):
++        return False
++    if today - latest_trade_date > timedelta(days=FRESHNESS_LOOKBACK_DAYS):
++        return True
++    candidate = latest_trade_date + timedelta(days=1)
++    while candidate < today:
++        if is_trade_day(candidate):
++            return True
++        candidate += timedelta(days=1)
++    return False
++
++
++def pipeline_steps(runs: list[dict], quality: dict) -> list[dict]:
++    """Project stored runs and data quality into the ordered admin pipeline."""
++    latest = {
++        run_type: next((run for run in runs if run.get("run_type") == run_type), None)
++        for run_type in ("sync", "factors", "model")
++    }
++    data_ready = bool(quality.get("is_complete")) and not bool(quality.get("is_stale"))
++    factor_ready = bool(latest["factors"] and latest["factors"].get("status") == "completed")
++    running = {
++        run_type
++        for run_type, run in latest.items()
++        if run and run.get("status") == "running"
++    }
++    return [
++        _step(
++            "sync",
++            "数据同步",
++            latest["sync"],
++            can_run="sync" not in running,
++            next_step="同步沪深300行情、财务和估值数据。",
++        ),
++        _quality_step(quality),
++        _step(
++            "factors",
++            "构建研究因子",
++            latest["factors"],
++            can_run=data_ready and "factors" not in running,
++            next_step="请先完成数据完整性检查。"
++            if not data_ready
++            else "使用最新完整数据构建研究因子。",
++        ),
++        _step(
++            "model",
++            "生成研究模型",
++            latest["model"],
++            can_run=factor_ready and "model" not in running,
++            next_step="请先完成一项研究因子运行。"
++            if not factor_ready
++            else "使用最近完成的因子生成研究结果。",
++            prerequisite_run_id=latest["factors"].get("run_id") if factor_ready else None,
++        ),
++    ]
++
++
++def _step(
++    step_id: str,
++    title: str,
++    run: dict | None,
++    *,
++    can_run: bool,
++    next_step: str,
++    prerequisite_run_id: str | None = None,
++) -> dict:
++    status = run.get("status") if run else None
++    state = _STATE_LABELS.get(status, "待执行" if run is None else "需要处理")
++    payload = (run or {}).get("payload") or {}
++    progress = payload.get("progress") or {}
++    if run is None:
++        summary = "尚未运行。"
++    elif status == "failed":
++        summary = "最近一次运行失败。"
++    elif status in {"not_trainable", "partial"}:
++        summary = "最近一次运行需要处理。"
++    elif status == "completed":
++        summary = "最近一次运行已完成。"
++    elif status == "running":
++        summary = "最近一次运行正在进行。"
++    else:
++        summary = "最近一次运行状态需要处理。"
++    return {
++        "id": step_id,
++        "title": title,
++        "state": state,
++        "summary": summary,
++        "next_step": next_step,
++        "can_run": bool(can_run),
++        "run_id": run.get("run_id") if run else None,
++        "prerequisite_run_id": prerequisite_run_id,
++        "progress": progress,
++    }
++
++
++def _quality_step(quality: dict) -> dict:
++    complete = bool(quality.get("is_complete"))
++    stale = bool(quality.get("is_stale"))
++    missing_prices = quality.get("missing_latest_price_codes") or []
++    missing_financials = quality.get("missing_financial_codes") or []
++    if stale:
++        summary = "最新交易日已过期，需要重新同步。"
++        next_step = "请重新同步数据后再执行完整性检查。"
++        state = "需要处理"
++    elif complete:
++        summary = "行情、财务和估值数据完整。"
++        next_step = "可以构建研究因子。"
++        state = "已完成"
++    else:
++        summary = (
++            f"仍需处理 {len(missing_prices)} 个行情缺口、"
++            f"{len(missing_financials)} 个财务缺口。"
++        )
++        next_step = "请先完成数据完整性检查。"
++        state = "需要处理"
++    return {
++        "id": "quality",
++        "title": "数据完整性检查",
++        "state": state,
++        "summary": summary,
++        "next_step": next_step,
++        "can_run": False,
++        "run_id": None,
++        "prerequisite_run_id": None,
++        "progress": {
++            "security_count": quality.get("security_count", 0),
++            "latest_trade_date": quality.get("latest_trade_date"),
++            "missing_latest_price_count": len(missing_prices),
++            "missing_financial_count": len(missing_financials),
++            "valuation_count": quality.get("valuation_count", 0),
++        },
++    }
++
++
++def filter_admin_runs(
++    runs: list[dict], run_type: str | None = None, status: str | None = None
++) -> list[dict]:
++    """Filter audit rows without changing their input ordering."""
++    return [
++        run
++        for run in runs
++        if (run_type is None or run.get("run_type") == run_type)
++        and (status is None or run.get("status") == status)
++    ]
++
++
++def retry_parameters(run: dict) -> dict | None:
++    """Extract only safe date and run-reference parameters for a failed run."""
++    if not isinstance(run, dict) or run.get("status") != "failed":
++        return None
++    run_type = run.get("run_type")
++    parameters = run.get("parameters") or {}
++    if not isinstance(parameters, dict) or run_type not in {"sync", "factors", "model"}:
++        return None
++
++    if run_type == "sync":
++        result = {}
++        for key in ("start_date", "end_date"):
++            parsed = _as_date(parameters.get(key))
++            if parsed is not None:
++                result[key] = parsed
++        return result
++
++    result = {}
++    date_key = "as_of_dates" if run_type == "factors" else "prediction_dates"
++    dates = parameters.get(date_key)
++    if isinstance(dates, (list, tuple)):
++        parsed_dates = [_as_date(item) for item in dates]
++        result[date_key] = [item for item in parsed_dates if item is not None]
++    elif dates is not None:
++        parsed = _as_date(dates)
++        if parsed is not None:
++            result[date_key] = [parsed]
++    if run_type == "model":
++        factor_run_id = parameters.get("factor_run_id")
++        if factor_run_id is not None and str(factor_run_id).strip():
++            result["factor_run_id"] = factor_run_id
++        # Keep the public order aligned with workflow parameters.
++        if "factor_run_id" in result and date_key in result:
++            result = {"factor_run_id": result["factor_run_id"], date_key: result[date_key]}
++    return result
++
++
++def _as_date(value) -> date | None:
++    if isinstance(value, datetime):
++        return value.date()
++    if isinstance(value, date):
++        return value
++    if isinstance(value, str):
++        try:
++            return date.fromisoformat(value[:10])
++        except ValueError:
++            return None
++    return None
++
++
++def redact_sensitive_text(value: str) -> str:
++    """Remove credentials and values of common secret-bearing fields."""
++    text = str(value or "")
++    text = _SENSITIVE_VALUE_RE.sub(r"\1\2[已隐藏]", text)
++    return _URL_CREDENTIAL_RE.sub(r"\1[已隐藏]@", text)
+--- /dev/null	2026-08-29 10:41:56
++++ quant/admin_ui.py	2026-08-29 10:39:33
+@@ -0,0 +1,361 @@
++"""Native Streamlit renderer for the deployment-gated administrator workbench."""
++
++from __future__ import annotations
++
++from datetime import date
++import os
++
++import pandas as pd
++
++from .admin import data_is_stale, filter_admin_runs, pipeline_steps, redact_sensitive_text, retry_parameters
++from .workflows import build_factor_run, sync_hs300, train_model_run
++
++
++def render_admin_workbench(st, store, *, today: date | None = None) -> None:
++    """Render operational controls without treating the page as authentication."""
++    st.title("管理员工作台")
++    st.caption("准备研究数据、执行研究流水线并诊断失败任务。")
++    _apply_retry_defaults(st)
++    if st.session_state.pop("admin_retry_ready", False):
++        st.success("已预填安全参数；请确认后手动提交任务。")
++
++    if hasattr(store, "fail_stale_sync_runs"):
++        store.fail_stale_sync_runs()
++    quality = dict(store.data_quality("hs300"))
++    quality["is_stale"] = data_is_stale(
++        quality.get("latest_trade_date"),
++        today=today or date.today(),
++        is_trade_day=store.is_trade_day,
++    )
++    counts = store.fast_counts()
++    runs = store.list_runs(200)
++
++    _render_overview(st, quality, counts)
++    _render_pipeline(st, store, quality, runs)
++    _render_audit(st, runs)
++
++
++def _render_overview(st, quality: dict, counts: dict) -> None:
++    st.subheader("数据概览")
++    security_count = int(quality.get("security_count") or counts.get("securities") or 0)
++    price_covered = max(0, security_count - len(quality.get("missing_latest_price_codes") or []))
++    financial_covered = max(0, security_count - len(quality.get("missing_financial_codes") or []))
++    metrics = st.container(horizontal=True, width="stretch")
++    metrics.metric("最新交易日", _display_date(quality.get("latest_trade_date")))
++    metrics.metric("证券数量", security_count)
++    metrics.metric("最新行情覆盖", _coverage(price_covered, security_count))
++    metrics.metric("财务覆盖", _coverage(financial_covered, security_count))
++    metrics.metric("估值记录", quality.get("valuation_count", counts.get("valuation_count", 0)))
++
++
++def _render_pipeline(st, store, quality: dict, runs: list[dict]) -> None:
++    st.subheader("研究流水线")
++    steps = pipeline_steps(runs, quality)
++    for step in steps:
++        with st.container(border=True, width="stretch"):
++            st.subheader(f"{step['title']} · {step['state']}")
++            st.write(step["summary"])
++            st.caption(f"下一步：{step['next_step']}")
++            if step["id"] == "sync":
++                _render_sync_form(st, store, step["can_run"])
++            elif step["id"] == "quality":
++                _render_quality_details(st, quality)
++            elif step["id"] == "factors":
++                _render_factor_form(st, store, step["can_run"], quality)
++            elif step["id"] == "model":
++                _render_model_form(st, store, step["can_run"], runs)
++
++
++def _render_quality_details(st, quality: dict) -> None:
++    if quality.get("is_stale"):
++        st.warning("数据日期已过期；请先重新同步并完成完整性检查。")
++    elif quality.get("is_complete"):
++        st.success("数据完整性检查已通过。")
++    else:
++        st.warning("数据尚未完整；请先同步并处理缺口。")
++    st.caption(
++        "缺最新行情："
++        f"{len(quality.get('missing_latest_price_codes') or [])} · "
++        "缺财务："
++        f"{len(quality.get('missing_financial_codes') or [])}"
++    )
++
++
++def _render_sync_form(st, store, can_run: bool) -> None:
++    start_default = _session_date(st, "admin_sync_retry_start", date(2020, 1, 1))
++    end_default = _session_date(st, "admin_sync_retry_end", date.today())
++    with st.form("admin_sync"):
++        entered_token = st.text_input(
++            "Tushare Token",
++            type="password",
++            value="",
++            key="admin_sync_token",
++        )
++        start = _date_input(st, "开始日期", start_default, "admin_sync_start")
++        end = _date_input(st, "结束日期", end_default, "admin_sync_end")
++        submitted = st.form_submit_button(
++            "开始同步",
++            key="admin_sync_submit",
++            type="primary",
++            disabled=not can_run,
++            width="content",
++        )
++    if not submitted:
++        return
++    token = entered_token or os.getenv("TUSHARE_TOKEN", "")
++    if not token:
++        st.error("请输入 Tushare Token；Token 不会被保存。")
++    elif start > end:
++        st.error("开始日期不能晚于结束日期。")
++    else:
++        try:
++            with st.status("正在同步研究数据…", expanded=True, width="stretch") as status:
++                run_id = sync_hs300(
++                    store,
++                    token,
++                    start,
++                    end,
++                    progress=lambda phase, current, total, detail=None: st.write(
++                        f"{phase}：{current}/{total}"
++                    ),
++                )
++                run = store.get_run(run_id)
++                _update_status(st, status, run, "同步")
++        except Exception as exc:
++            st.error(f"同步未能启动：{redact_sensitive_text(str(exc))}")
++
++
++def _render_factor_form(st, store, can_run: bool, quality: dict) -> None:
++    latest = _coerce_date(quality.get("latest_trade_date"))
++    default_cutoff = latest
++    if default_cutoff is None:
++        default_cutoff = date.today()
++    with st.form("admin_factors"):
++        cutoff = _date_input(st, "因子截止日期", default_cutoff, "admin_factor_cutoff")
++        submitted = st.form_submit_button(
++            "构建研究因子",
++            key="admin_factors_submit",
++            type="primary",
++            disabled=not can_run or latest is None,
++            width="content",
++        )
++    if not submitted:
++        return
++    if latest is None or cutoff > latest:
++        st.error("因子截止日期必须是最新可用交易日或更早日期。")
++        return
++    dates_up_to_cutoff = _trading_dates_through(store, cutoff)
++    if not dates_up_to_cutoff:
++        st.error("所选截止日期前没有可用交易日；请先同步行情数据。")
++        return
++    with st.status("正在构建研究因子…", expanded=True, width="stretch") as status:
++        run_id = build_factor_run(store, dates_up_to_cutoff)
++        _update_status(st, status, store.get_run(run_id), "因子运行")
++
++
++def _render_model_form(st, store, can_run: bool, runs: list[dict]) -> None:
++    factor_runs = [
++        run for run in runs if run.get("run_type") == "factors" and run.get("status") == "completed"
++    ]
++    retry_factor_run_id = st.session_state.pop("admin_model_retry_factor_run_id", None)
++    if retry_factor_run_id:
++        retry_index = next(
++            (index for index, run in enumerate(factor_runs) if run.get("run_id") == retry_factor_run_id),
++            None,
++        )
++        if retry_index is not None:
++            st.session_state["admin_model_factor_run"] = retry_index
++    factor_index = None
++    if factor_runs:
++        factor_index = st.selectbox(
++            "因子运行",
++            range(len(factor_runs)),
++            format_func=lambda index: f"已完成因子运行（截止 {_display_date(_factor_run_end_date(factor_runs[index]))}）",
++            key="admin_model_factor_run",
++        )
++    factor_run = factor_runs[factor_index] if factor_index is not None else None
++    default_prediction = _factor_run_end_date(factor_run)
++    if default_prediction is None:
++        default_prediction = date.today()
++    with st.form("admin_model"):
++        st.caption("使用最近完成的因子运行。")
++        prediction_date = _date_input(
++            st, "预测日期", default_prediction, "admin_model_prediction_date"
++        )
++        submitted = st.form_submit_button(
++            "生成研究模型",
++            key="admin_model_submit",
++            type="primary",
++            disabled=not can_run or factor_run is None or _factor_run_end_date(factor_run) is None,
++            width="content",
++        )
++    if not submitted or factor_run is None:
++        return
++    with st.status("正在生成研究模型…", expanded=True, width="stretch") as status:
++        run_id = train_model_run(store, factor_run["run_id"], [prediction_date])
++        _update_status(st, status, store.get_run(run_id), "模型运行")
++
++
++def _update_status(st, status, run: dict, activity: str) -> None:
++    state = run.get("status")
++    if state == "completed":
++        status.update(label=f"{activity}已完成", state="complete")
++        st.success(f"{activity}已完成。")
++    elif state == "not_trainable":
++        status.update(label=f"{activity}需要处理", state="error")
++        st.warning("运行未产生可训练结果；请检查数据完整性和日期范围。")
++    else:
++        status.update(label=f"{activity}失败", state="error")
++        st.error("运行失败；请在审计记录中查看已脱敏的技术原因。")
++
++
++def _render_audit(st, runs: list[dict]) -> None:
++    st.subheader("运行审计")
++    run_types = sorted({str(run.get("run_type")) for run in runs if run.get("run_type")})
++    statuses = sorted({str(run.get("status")) for run in runs if run.get("status")})
++    controls = st.container(horizontal=True, width="stretch")
++    type_label = controls.selectbox("任务类型", ["全部", *run_types], key="admin_audit_type")
++    status_label = controls.selectbox("运行状态", ["全部", *statuses], key="admin_audit_status")
++    selected_runs = filter_admin_runs(
++        runs,
++        None if type_label == "全部" else type_label,
++        None if status_label == "全部" else status_label,
++    )
++    rows = [
++        {
++            "任务类型": run.get("run_type") or "未记录",
++            "状态": run.get("status") or "未记录",
++            "开始时间": _display_datetime(run.get("created_at")),
++            "结束时间": _display_datetime(run.get("completed_at")),
++        }
++        for run in selected_runs
++    ]
++    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
++
++    failed = [run for run in selected_runs if run.get("status") == "failed"]
++    if not failed:
++        return
++    selected_index = st.selectbox(
++        "选择失败任务",
++        range(len(failed)),
++        format_func=lambda index: (
++            f"{failed[index].get('run_type', '未记录')} · "
++            f"{_display_datetime(failed[index].get('created_at'))}"
++        ),
++        key="admin_failed_run",
++    )
++    selected = failed[selected_index]
++    safe_parameters = retry_parameters(selected)
++    with st.expander("失败任务技术详情"):
++        st.caption(f"运行 ID：{selected.get('run_id', '未记录')}")
++        safe_error = redact_sensitive_text(selected.get("error") or "未记录技术原因")
++        st.code(safe_error, language=None)
++        if safe_parameters is None:
++            st.info("该失败任务没有可安全复用的参数。")
++        else:
++            st.write("可安全复用的参数：")
++            st.json(_display_retry_parameters(safe_parameters))
++    if safe_parameters and st.button("准备重试参数", key="admin_prepare_retry", width="content"):
++        _prepare_retry(st, selected.get("run_type"), safe_parameters)
++        st.session_state["admin_retry_ready"] = True
++        st.rerun()
++
++
++def _prepare_retry(st, run_type: str | None, parameters: dict) -> None:
++    if run_type == "sync":
++        if parameters.get("start_date"):
++            st.session_state["admin_sync_retry_start"] = parameters["start_date"]
++        if parameters.get("end_date"):
++            st.session_state["admin_sync_retry_end"] = parameters["end_date"]
++    elif run_type == "factors":
++        dates = list(parameters.get("as_of_dates") or [])
++        if dates:
++            st.session_state["admin_factor_retry_cutoff"] = dates[-1]
++    elif run_type == "model":
++        factor_run_id = parameters.get("factor_run_id")
++        if factor_run_id:
++            st.session_state["admin_model_retry_factor_run_id"] = factor_run_id
++        dates = list(parameters.get("prediction_dates") or [])
++        if dates:
++            st.session_state["admin_model_retry_prediction_date"] = dates[-1]
++
++
++def _apply_retry_defaults(st) -> None:
++    pending = {
++        "admin_sync_retry_start": "admin_sync_start",
++        "admin_sync_retry_end": "admin_sync_end",
++        "admin_factor_retry_cutoff": "admin_factor_cutoff",
++        "admin_model_retry_prediction_date": "admin_model_prediction_date",
++    }
++    for pending_key, widget_key in pending.items():
++        value = st.session_state.pop(pending_key, None)
++        if value is not None:
++            st.session_state[widget_key] = value
++
++
++def _factor_run_end_date(run: dict | None) -> date | None:
++    if not run:
++        return None
++    payload = run.get("payload") or {}
++    metadata = payload.get("metadata") or {}
++    value = _coerce_date(metadata.get("date_end"))
++    if value is not None:
++        return value
++    return max(
++        (_coerce_date(row.get("as_of_date")) for row in payload.get("rows") or []),
++        default=None,
++    )
++
++
++def _trading_dates_through(store, cutoff: date) -> list[date]:
++    memory = store.load_memory()
++    return sorted(
++        {
++            trade_date
++            for price in memory.prices.values()
++            if (trade_date := _coerce_date(price.trade_date)) is not None and trade_date <= cutoff
++        }
++    )
++
++
++def _session_date(st, key: str, fallback: date) -> date:
++    return _coerce_date(st.session_state.get(key)) or fallback
++
++
++def _date_input(st, label: str, default: date, key: str) -> date:
++    if key in st.session_state:
++        return st.date_input(label, key=key)
++    return st.date_input(label, default, key=key)
++
++
++def _coerce_date(value) -> date | None:
++    if isinstance(value, date):
++        return value
++    if isinstance(value, str):
++        try:
++            return date.fromisoformat(value[:10])
++        except ValueError:
++            return None
++    return None
++
++
++def _display_date(value) -> str:
++    parsed = _coerce_date(value)
++    return parsed.isoformat() if parsed else "不可用"
++
++
++def _display_datetime(value) -> str:
++    return str(value) if value else "未记录"
++
++
++def _coverage(covered: int, total: int) -> str:
++    return "不可用" if total <= 0 else f"{covered}/{total}"
++
++
++def _display_retry_parameters(parameters: dict) -> dict:
++    return {
++        key: [item.isoformat() if isinstance(item, date) else item for item in value]
++        if isinstance(value, list)
++        else value.isoformat() if isinstance(value, date) else value
++        for key, value in parameters.items()
++    }
+--- /dev/null	2026-08-29 10:41:56
++++ quant/public_status_ui.py	2026-08-29 09:53:27
+@@ -0,0 +1,54 @@
++"""Read-only public research data status renderer."""
++
++from __future__ import annotations
++
++import pandas as pd
++
++from .presentation import public_run_status_label
++from .ui import metric_cards, page_header, research_disclaimer
++
++
++_STAGES = (
++    ("sync", "数据同步"),
++    ("factors", "因子构建"),
++    ("model", "模型预测"),
++    ("backtest", "回测验证"),
++)
++_STATUS_LABELS = {
++    "completed": "已完成",
++    "not_trainable": "不可训练",
++    "failed": "失败",
++    "running": "进行中",
++}
++
++
++def public_status_rows(runs: list[dict]) -> list[dict]:
++    """Project newest-first run history into safe public workflow stages."""
++    latest_runs = {}
++    for run in runs:
++        run_type = run.get("run_type")
++        if run_type not in latest_runs:
++            latest_runs[run_type] = run
++    return [
++        {"阶段": label, "状态": public_run_status_label(latest_runs.get(run_type))}
++        for run_type, label in _STAGES
++    ]
++
++
++def render_public_data_status(st, quality: dict, counts: dict, runs: list[dict]) -> None:
++    """Render freshness and user-facing workflow stages without operational controls."""
++    page_header(st, "数据状态", "确认数据新鲜度、覆盖范围和研究运行状态。")
++    metric_cards(
++        st,
++        [
++            ("最新行情", str(quality.get("latest_trade_date") or "不可用"), "交易日"),
++            ("证券", str(counts.get("securities", 0)), "当前研究范围"),
++            ("行情记录", str(counts.get("prices", 0)), "price_bars"),
++            ("财务记录", str(counts.get("financials", 0)), "已披露记录"),
++            ("估值记录", str(counts.get("valuation_count", 0)), "daily_basic"),
++        ],
++    )
++    st.subheader("研究状态")
++    rows = public_status_rows(runs)
++    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
++    research_disclaimer(st)
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-3-fix1-before/presentation.py	2026-08-29 09:51:15
++++ quant/presentation.py	2026-08-29 09:56:04
+@@ -10,7 +10,21 @@
+ 
+ UNAVAILABLE = "不可用"
+ 
++_PUBLIC_RUN_TYPES = {
++    "sync": "数据同步",
++    "factors": "因子构建",
++    "model": "模型研究",
++    "backtest": "历史回测",
++    "portfolio_backtest": "组合历史回测",
++}
++_PUBLIC_RUN_STATUSES = {
++    "completed": "已完成",
++    "not_trainable": "不可训练",
++    "failed": "失败",
++    "running": "进行中",
++}
+ 
++
+ def sanitize_display_value(value):
+     """Return a value safe for display, marking absent or non-finite data unavailable."""
+     if value is None:
+@@ -33,6 +47,41 @@
+     return f"{clean:.2%}" if percent else f"{clean:.2f}"
+ 
+ 
++def public_run_type_label(run: dict | None) -> str:
++    """Return a user-facing run-type label without operational identifiers."""
++    return _PUBLIC_RUN_TYPES.get((run or {}).get("run_type"), "研究运行")
++
++
++def public_run_status_label(run: dict | None) -> str:
++    """Return a user-facing status label without propagating stored details."""
++    return _PUBLIC_RUN_STATUSES.get((run or {}).get("status"), "待执行")
++
++
++def public_run_label(run: dict | None) -> str:
++    """Return the safe display label for a selected public research run."""
++    return f"{public_run_type_label(run)} · {public_run_status_label(run)}"
++
++
++def public_run_feedback(run: dict, completed_message: str) -> tuple[str, str]:
++    """Map a persisted run to public feedback without exposing stored errors or IDs."""
++    if run.get("status") == "completed":
++        return "success", completed_message
++    run_type = public_run_type_label(run)
++    if run.get("status") == "not_trainable":
++        return "warning", f"{run_type}当前没有可用结果。请检查数据覆盖后重试。"
++    if run.get("status") == "running":
++        return "info", f"{run_type}正在进行。"
++    return "error", f"{run_type}未能完成。请稍后重试或联系管理员。"
++
++
++def public_run_rows(runs: list[dict]) -> list[dict]:
++    """Project public run history without raw IDs, parameters, or stored errors."""
++    return [
++        {"研究类型": public_run_type_label(run), "状态": public_run_status_label(run)}
++        for run in runs
++    ]
++
++
+ def status_feedback(run, completed_message: str) -> tuple[str, str]:
+     """Map a persisted research run to the only truthful Streamlit feedback level."""
+     if run.get("status") == "completed":
+@@ -41,4 +90,4 @@
+         if run.get("run_type") == "factors":
+             return "warning", "因子运行没有可用行。请检查数据覆盖、财务披露和截止日期。"
+         return "warning", run_status_summary(run)["next_step"]
+-    return "error", run.get("error") or "运行失败"
++    return public_run_feedback(run, completed_message)
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-3-before/streamlit_app.py	2026-08-29 09:40:52
++++ streamlit_app.py	2026-08-29 09:54:49
+@@ -7,6 +7,8 @@
+ import plotly.graph_objects as go
+ import streamlit as st
+ 
++from quant.admin import admin_mode_enabled, database_unavailable_copy, navigation_pages
++from quant.admin_ui import render_admin_workbench
+ from quant.insights import (
+     data_quality_summary,
+     filter_candidate_rows,
+@@ -20,7 +22,15 @@
+     research_candidate_rows,
+     run_status_summary,
+ )
+-from quant.presentation import format_metric, sanitize_display_rows, sanitize_display_value, status_feedback
++from quant.presentation import (
++    format_metric,
++    public_run_feedback,
++    public_run_label,
++    public_run_rows,
++    sanitize_display_rows,
++    sanitize_display_value,
++)
++from quant.public_status_ui import render_public_data_status
+ from quant.storage import PostgresStore
+ from quant.ui import empty_state, inject_workspace_css, metric_cards, page_header, research_disclaimer, security_option_label, status_badge
+ from quant.workflows import build_factor_run, run_backtest_run, run_portfolio_backtest_run, sync_hs300, train_model_run
+@@ -168,12 +178,17 @@
+         else:
+             params = latest_sync.get("parameters") or {}
+             counts = sync_payload.get("row_counts") or {}
+-            level = st.success if latest_sync["status"] == "completed" else st.error
+             price_count = counts.get("price_count", counts.get("prices", "不可用"))
+             financial_count = counts.get("financial_count", counts.get("financials", "不可用"))
+             valuation_count = counts.get("valuation_count", counts.get("valuations", "不可用"))
+-            error_suffix = f" · 原因：{latest_sync.get('error')}" if latest_sync.get("error") else ""
+-            level(f"最近同步：{latest_sync['status']} · 请求区间 {params.get('start_date', '不可用')} 至 {params.get('end_date', '不可用')} · 行情 {price_count} 条 · 财务 {financial_count} 条 · 估值 {valuation_count} 条{error_suffix}")
++            feedback_level, feedback_message = public_run_feedback(
++                latest_sync, "最近数据同步已完成。"
++            )
++            getattr(st, feedback_level)(
++                f"{feedback_message} 请求区间 {params.get('start_date', '不可用')} 至 "
++                f"{params.get('end_date', '不可用')} · 行情 {price_count} 条 · "
++                f"财务 {financial_count} 条 · 估值 {valuation_count} 条"
++            )
+             if latest_sync["status"] == "completed" and valuation_count == 0:
+                 st.warning("同步运行完成，但每日估值返回 0 行；请检查 Tushare daily_basic 权限或积分。")
+     token = st.text_input("Tushare Token", type="password", value=os.getenv("TUSHARE_TOKEN", ""))
+@@ -199,8 +214,8 @@
+             run_id = sync_hs300(store, token, start, end, progress=report_progress)
+             progress_bar.progress(1.0, text="同步完成")
+             run = store.get_run(run_id)
+-            feedback = st.success if run["status"] == "completed" else st.error
+-            feedback(f"同步运行 {run_id}：{run['status']} {run['error'] or ''}")
++            feedback_level, feedback_message = public_run_feedback(run, "数据同步已完成。")
++            getattr(st, feedback_level)(feedback_message)
+     st.dataframe(frame(store.status()["audit"]), use_container_width=True)
+ 
+ 
+@@ -347,13 +362,13 @@
+     if st.button("构建六类 PIT 因子"):
+         run_id = build_factor_run(store, [day for day in dates if day <= selected])
+         run = store.get_run(run_id)
+-        feedback_level, feedback_message = status_feedback(run, f"因子运行已完成：{run_id}")
++        feedback_level, feedback_message = public_run_feedback(run, "因子构建已完成。")
+         getattr(st, feedback_level)(feedback_message)
+     runs = [run for run in store.list_runs() if run["run_type"] == "factors"]
+     if not runs:
+         st.info("尚无因子运行。下一步：选择截止日并构建覆盖预测日期的因子。")
+         return
+-    run = st.selectbox("因子运行", runs, format_func=lambda value: f"{value['run_id']} · {value['status']}")
++    run = st.selectbox("因子运行", runs, format_func=public_run_label)
+     metadata = run_payload(run).get("metadata") or {}
+     coverage = st.columns(3)
+     coverage[0].metric("开始日期", sanitize_display_value(metadata.get("date_start")))
+@@ -371,7 +386,7 @@
+     if not factor_runs:
+         st.info("请先完成一项因子运行，并确保其覆盖所选预测日期。")
+         return
+-    factor_run = st.selectbox("因子运行", factor_runs, format_func=lambda value: value["run_id"])
++    factor_run = st.selectbox("因子运行", factor_runs, format_func=public_run_label)
+     default_date = factor_run_end_date(factor_run)
+     if default_date is None:
+         st.warning("所选因子运行没有可用日期，无法训练模型。")
+@@ -380,13 +395,13 @@
+     if st.button("训练模型并生成研究信号"):
+         run_id = train_model_run(store, factor_run["run_id"], [prediction_date])
+         run = store.get_run(run_id)
+-        feedback_level, feedback_message = status_feedback(run, f"模型运行已完成：{run_id}")
++        feedback_level, feedback_message = public_run_feedback(run, "模型研究已完成。")
+         getattr(st, feedback_level)(feedback_message)
+     models = [run for run in store.list_runs() if run["run_type"] == "model"]
+     if not models:
+         st.info("尚无模型运行。下一步：使用覆盖预测日期和更早日期的因子运行。")
+         return
+-    model = st.selectbox("模型运行", models, format_func=lambda value: f"{value['run_id']} · {run_status_summary(value)['label']}")
++    model = st.selectbox("模型运行", models, format_func=public_run_label)
+     summary = run_status_summary(model)
+     metadata = run_payload(model).get("metadata") or {}
+     prediction_dates = metadata.get("prediction_dates") or (model.get("parameters") or {}).get("prediction_dates") or []
+@@ -411,7 +426,8 @@
+         if summary["reason"]:
+             st.caption(f"不可训练原因：{summary['reason']}")
+     else:
+-        st.error(model.get("error") or "模型运行失败")
++        feedback_level, feedback_message = public_run_feedback(model, "模型研究已完成。")
++        getattr(st, feedback_level)(feedback_message)
+ 
+ 
+ def render_strategy_configuration():
+@@ -434,20 +450,22 @@
+     if not models:
+         st.info("请先完成模型训练，再运行历史回测。")
+         return
+-    model = st.selectbox("模型运行", models, format_func=lambda value: value["run_id"])
++    model = st.selectbox("模型运行", models, format_func=public_run_label)
+     top_n = st.number_input("持仓数", 1, 300, 30)
+     cost = st.number_input("单边成本（bps）", 0.0, value=10.0)
+     if st.button("运行历史回测"):
+         run_id = run_backtest_run(store, model["run_id"], int(top_n), float(cost))
+         run = store.get_run(run_id)
+-        (st.success if run["status"] == "completed" else st.error)(f"回测运行 {run_id}：{run['status']} {run['error'] or ''}")
++        feedback_level, feedback_message = public_run_feedback(run, "历史回测已完成。")
++        getattr(st, feedback_level)(feedback_message)
+     results = [run for run in store.list_runs() if run["run_type"] == "backtest"]
+     if not results:
+         st.info("尚无回测结果。下一步：选择已完成的模型运行并执行历史回测。")
+         return
+     result = results[0]
+     if result["status"] != "completed":
+-        st.error(result.get("error") or "回测失败")
++        feedback_level, feedback_message = public_run_feedback(result, "历史回测已完成。")
++        getattr(st, feedback_level)(feedback_message)
+         return
+     metrics = run_payload(result).get("metrics") or {}
+     payload = run_payload(result)
+@@ -487,7 +505,7 @@
+ def render_run_records(store):
+     runs = store.list_runs()
+     if runs:
+-        st.dataframe(frame(runs), use_container_width=True)
++        st.dataframe(frame(public_run_rows(runs)), use_container_width=True)
+     else:
+         st.info("暂无运行记录。请从数据同步开始研究流程。")
+ 
+@@ -553,7 +571,7 @@
+     if st.button("刷新今日机会", type="primary"):
+         try:
+             run_id = refresh_today_opportunities(store)
+-            st.success(f"已保存最新研究快照：{run_id}")
++            st.success("已更新最新研究快照。")
+             _safe_rerun(st)
+         except ValueError as exc:
+             st.warning(str(exc))
+@@ -635,7 +653,7 @@
+         research_disclaimer(st)
+         return
+     with st.form("strategy_experiment"):
+-        model = st.selectbox("模型运行", models, format_func=lambda value: value["run_id"])
++        model = st.selectbox("模型运行", models, format_func=public_run_label)
+         template_id = st.selectbox("策略模板", list(TEMPLATES), format_func=lambda key: TEMPLATES[key].name)
+         experiment_name = st.text_input("实验名称", value=f"{TEMPLATES[template_id].name} · {date.today().isoformat()}")
+         controls = st.columns(2)
+@@ -645,17 +663,13 @@
+     if submitted:
+         run_id = run_backtest_run(store, model["run_id"], int(top_n), float(cost), template_id=template_id, experiment_name=experiment_name.strip() or "未命名实验")
+         run = store.get_run(run_id)
+-        if run["status"] == "completed":
+-            st.success(f"实验已保存：{run_id}")
+-        elif run["status"] == "not_trainable":
+-            st.warning(run.get("error") or "样本不足，无法完成实验")
+-        else:
+-            st.error(run.get("error") or "实验失败")
++        feedback_level, feedback_message = public_run_feedback(run, "历史实验已保存。")
++        getattr(st, feedback_level)(feedback_message)
+     st.info("调仓频率固定为月度；模板会记录研究假设，回测只使用真实已有模型分数。")
+     experiments = [run for run in store.list_runs() if run["run_type"] == "backtest"]
+     if experiments:
+         st.markdown("### 最近实验")
+-        st.dataframe(frame([{**(run.get("parameters") or {}), "状态": run["status"], "运行 ID": run["run_id"]} for run in experiments[:10]]), hide_index=True, use_container_width=True)
++        st.dataframe(frame(public_run_rows(experiments[:10])), hide_index=True, use_container_width=True)
+     research_disclaimer(st)
+ 
+ 
+@@ -714,7 +728,8 @@
+     if positions and st.button("运行我的组合历史回测", type="primary"):
+         run_id = run_portfolio_backtest_run(store)
+         run = store.get_run(run_id)
+-        (st.success if run["status"] == "completed" else st.warning)(f"组合回测 {run_id}：{run['status']} {run.get('error') or ''}")
++        feedback_level, feedback_message = public_run_feedback(run, "组合历史回测已完成。")
++        getattr(st, feedback_level)(feedback_message)
+     personal_runs = [run for run in store.list_runs() if run["run_type"] == "portfolio_backtest"]
+     if personal_runs:
+         st.markdown("### 我的组合回测")
+@@ -723,40 +738,16 @@
+         if personal["status"] == "completed":
+             metric_cards(st, [("组合累计收益", format_metric((payload.get("metrics") or {}).get("total_return"), percent=True), "按保存权重买入并持有"), ("相对沪深300", format_metric((payload.get("metrics") or {}).get("excess_return"), percent=True), "共同交易日"), ("最大回撤", format_metric((payload.get("metrics") or {}).get("max_drawdown"), percent=True), "历史样本")])
+         else:
+-            st.warning(personal.get("error") or "组合历史数据不足")
++            feedback_level, feedback_message = public_run_feedback(personal, "组合历史回测已完成。")
++            getattr(st, feedback_level)(feedback_message)
+     research_disclaimer(st)
+ 
+ 
+ def render_data_status(store):
+     memory = page_memory(store, price_days=2)
+-    page_header(st, "数据状态", "确认数据新鲜度、覆盖范围和研究运行状态。")
+     quality = data_quality_summary(memory)
+     counts = store.fast_counts()
+-    metric_cards(st, [("最新行情", str(quality["latest_trade_date"] or "不可用"), "交易日"), ("证券", str(counts.get("securities", 0)), "当前研究范围"), ("行情记录", str(counts.get("prices", 0)), "price_bars"), ("财务记录", str(counts.get("financials", 0)), "已披露记录"), ("估值记录", str(counts.get("valuation_count", 0)), "daily_basic")])
+-    runs = store.list_runs()
+-    if runs:
+-        st.markdown("### 研究状态")
+-        state_rows = []
+-        for run_type, label in (("sync", "数据同步"), ("factors", "因子构建"), ("model", "模型预测"), ("backtest", "回测验证")):
+-            run = next((item for item in runs if item["run_type"] == run_type), None)
+-            if not run:
+-                state_rows.append({"阶段": label, "状态": "待执行", "运行 ID": "—"})
+-            else:
+-                status = run["status"]
+-                label_status = "已完成" if status == "completed" else "不可训练" if status == "not_trainable" else "失败" if status == "failed" else "进行中"
+-                state_rows.append({"阶段": label, "状态": label_status, "运行 ID": run["run_id"]})
+-        st.dataframe(frame(state_rows), hide_index=True, use_container_width=True)
+-    with st.expander("数据同步", expanded=False):
+-        render_data_management(store)
+-    with st.expander("因子与模型运行", expanded=False):
+-        render_factor_research(store)
+-        st.divider()
+-        render_model_training(store)
+-    with st.expander("运行记录与同步审计"):
+-        render_run_records(store)
+-    with st.expander("研究流程说明"):
+-        st.markdown("1. 同步沪深300数据。\n2. 构建覆盖目标日期的因子。\n3. 训练模型并生成研究信号。\n4. 使用真实模型结果进行历史回测。")
+-    research_disclaimer(st)
++    render_public_data_status(st, quality, counts, store.list_runs())
+ 
+ 
+ @st.cache_resource(show_spinner=False)
+@@ -767,23 +758,25 @@
+ inject_workspace_css(st)
+ st.sidebar.markdown("### 量化研究工作台")
+ st.sidebar.caption("沪深300 · 研究信号")
++admin_mode = admin_mode_enabled(os.getenv("QUANT_ADMIN_MODE"))
++pages = navigation_pages(admin_mode)
++page = st.sidebar.radio("研究模块", pages, index=0)
+ dsn = os.getenv("DATABASE_URL", "")
+ if not dsn:
++    title, detail, next_step = database_unavailable_copy(admin_mode)
+     page_header(st, "量化研究工作台", "配置数据连接后开始研究。")
+-    empty_state(st, "尚未连接研究数据库", "页面只读取 PostgreSQL 中已经同步的数据，不会在刷新时自动请求外部接口。", "请在部署环境配置 DATABASE_URL；连接方式见 README。")
+-    with st.expander("高级数据连接设置"):
+-        st.caption("当前部署未提供 DATABASE_URL。请通过 Docker Compose 或运行环境变量配置连接串，避免在页面中保存凭据。")
++    empty_state(st, title, detail, next_step)
+     research_disclaimer(st)
+     st.stop()
+ try:
+     store = repository(dsn)
+     store.initialize()
+-except Exception as exc:
+-    st.error(f"数据库不可用：{exc}")
++except Exception:
++    title, detail, next_step = database_unavailable_copy(admin_mode)
++    empty_state(st, title, detail, next_step)
++    research_disclaimer(st)
+     st.stop()
+ 
+-page = st.sidebar.radio("研究模块", ["今日机会", "股票池", "个股研究", "行业景气", "策略实验室", "组合", "回测", "数据状态"], index=0)
+-
+ if page == "今日机会":
+     render_today_opportunities(store)
+ elif page == "股票池":
+@@ -798,5 +791,7 @@
+     render_portfolio(store)
+ elif page == "回测":
+     render_backtest_results(store)
++elif page == "管理员":
++    render_admin_workbench(st, store)
+ else:
+     render_data_status(store)
+--- /dev/null	2026-08-29 10:41:56
++++ tests/test_admin_workbench.py	2026-08-29 10:39:16
+@@ -0,0 +1,387 @@
++import unittest
++import inspect
++from datetime import date
++import os
++from pathlib import Path
++from unittest.mock import patch
++
++from streamlit.testing.v1 import AppTest
++
++import quant.admin as admin
++from quant.admin import (
++    admin_mode_enabled,
++    database_unavailable_copy,
++    filter_admin_runs,
++    navigation_pages,
++    pipeline_steps,
++    redact_sensitive_text,
++    retry_parameters,
++)
++from quant.public_status_ui import public_status_rows
++from quant.admin_ui import render_admin_workbench
++
++
++class AdminWorkbenchTests(unittest.TestCase):
++    def test_navigation_pages_and_database_copy_are_audience_specific(self):
++        """A public deployment must not expose the administrator route or setup details."""
++        public_pages = ["今日机会", "股票池", "个股研究", "行业景气", "策略实验室", "组合", "回测", "数据状态"]
++        self.assertEqual(navigation_pages(False), public_pages)
++        self.assertEqual(navigation_pages(True), [*public_pages, "管理员"])
++        self.assertEqual(
++            database_unavailable_copy(False),
++            ("研究数据正在准备", "当前暂时无法加载研究数据。", "请稍后刷新页面。"),
++        )
++        self.assertEqual(
++            database_unavailable_copy(True),
++            ("尚未连接研究数据库", "管理员部署尚未提供研究数据库。", "请在部署环境配置 DATABASE_URL。"),
++        )
++
++    def test_public_data_status_renders_stages_without_management_controls_or_run_ids(self):
++        """Public data status must remain a read-only progress view."""
++        app_file = Path(__file__).parent / "fixtures" / "public_status_app.py"
++        at = AppTest.from_file(str(app_file)).run(timeout=10)
++
++        self.assertEqual(len(at.exception), 0)
++        self.assertEqual(len(at.button), 0)
++        rendered = "\n".join(
++            str(element.value)
++            for elements in (at.markdown, at.caption, at.subheader, at.dataframe)
++            for element in elements
++        )
++        for forbidden in (
++            "run-secret-123",
++            "运行 ID",
++            "开始同步",
++            "构建研究因子",
++            "生成研究模型",
++            "Tushare Token",
++            "DATABASE_URL",
++            "PostgreSQL",
++        ):
++            self.assertNotIn(forbidden, rendered)
++        self.assertIn("因子构建  已完成", rendered)
++
++    def test_public_status_uses_the_first_newest_run_for_each_stage(self):
++        """Run lists are newest-first, so later entries must not overwrite a current state."""
++        rows = public_status_rows(
++            [
++                {"run_id": "new-factor-run", "run_type": "factors", "status": "completed"},
++                {
++                    "run_id": "old-factor-run",
++                    "run_type": "factors",
++                    "status": "failed",
++                    "error": "dsn=postgresql://user:pass@db.example/research",
++                },
++            ]
++        )
++        self.assertEqual(
++            next(row for row in rows if row["阶段"] == "因子构建"),
++            {"阶段": "因子构建", "状态": "已完成"},
++        )
++
++    def _admin_app(self, mode="guarded", token=None):
++        app_file = Path(__file__).parent / "fixtures" / "admin_workbench_app.py"
++        environment = {"ADMIN_FIXTURE_MODE": mode}
++        if token is not None:
++            environment["TUSHARE_TOKEN"] = token
++        with patch.dict(os.environ, environment, clear=False):
++            return AppTest.from_file(str(app_file)).run(timeout=10)
++
++    def test_admin_renderer_keeps_deployment_token_server_side_until_sync_submit(self):
++        """Prefilling the password field would send a deployment token to the browser."""
++        deployment_token = "deployment-token-value"
++        at = self._admin_app("enabled", deployment_token)
++
++        self.assertEqual(at.text_input(key="admin_sync_token").value, "")
++        self.assertNotIn(deployment_token, repr(at.session_state))
++        with patch.dict(
++            os.environ,
++            {"ADMIN_FIXTURE_MODE": "enabled", "TUSHARE_TOKEN": deployment_token},
++            clear=False,
++        ):
++            at.button(key="admin_sync_submit").click().run(timeout=10)
++        self.assertEqual(len(at.exception), 0)
++        self.assertTrue(any("同步已完成" in message.value for message in at.success))
++        self.assertNotIn(deployment_token, repr(at.session_state))
++
++    def test_factor_submit_uses_every_available_trading_date_through_cutoff(self):
++        """A singleton cutoff loses the historical factor inputs required by the workflow."""
++        at = self._admin_app("enabled")
++
++        self.assertFalse(at.button(key="admin_factors_submit").disabled)
++        with patch.dict(os.environ, {"ADMIN_FIXTURE_MODE": "enabled"}, clear=False):
++            at.button(key="admin_factors_submit").click().run(timeout=10)
++
++        self.assertIn(
++            "测试因子日期：2026-08-25,2026-08-26,2026-08-27",
++            [caption.value for caption in at.caption],
++        )
++
++    def test_model_retry_prefills_its_safe_factor_reference_and_uses_it_on_submit(self):
++        """Discarding a failed model's safe factor reference changes the retry input."""
++        at = self._admin_app("model-retry")
++
++        with patch.dict(os.environ, {"ADMIN_FIXTURE_MODE": "model-retry"}, clear=False):
++            at.button(key="admin_prepare_retry").click().run(timeout=10)
++
++        self.assertEqual(at.selectbox(key="admin_model_factor_run").value, 1)
++        self.assertFalse(at.button(key="admin_model_submit").disabled)
++        with patch.dict(os.environ, {"ADMIN_FIXTURE_MODE": "model-retry"}, clear=False):
++            at.button(key="admin_model_submit").click().run(timeout=10)
++        self.assertIn("测试模型因子运行：factor-retry", [caption.value for caption in at.caption])
++
++    def test_admin_renderer_shows_guarded_pipeline_and_redacts_audit_error(self):
++        """Removing a guard or rendering raw errors would expose broken admin behavior."""
++        at = self._admin_app()
++
++        self.assertEqual(at.title[0].value, "管理员工作台")
++        self.assertEqual(at.button(key="admin_sync_submit").form_id, "admin_sync")
++        self.assertEqual(at.button(key="admin_factors_submit").form_id, "admin_factors")
++        self.assertEqual(at.button(key="admin_model_submit").form_id, "admin_model")
++        self.assertTrue(at.button(key="admin_factors_submit").disabled)
++        self.assertTrue(at.button(key="admin_model_submit").disabled)
++        code_values = [element.value for element in at.code]
++        self.assertTrue(any("[已隐藏]" in value for value in code_values))
++        self.assertFalse(any("secret-token-value" in value for value in code_values))
++        self.assertNotIn("secret-token-value", repr(at.session_state))
++
++    def test_admin_renderer_prefills_safe_sync_retry_without_submitting_it(self):
++        """A retry must copy only date parameters and still require manual submission."""
++        at = self._admin_app()
++
++        at.button(key="admin_prepare_retry").click().run(timeout=10)
++
++        self.assertEqual(at.date_input(key="admin_sync_start").value, date(2026, 8, 1))
++        self.assertEqual(at.date_input(key="admin_sync_end").value, date(2026, 8, 27))
++        self.assertEqual(at.button(key="admin_sync_submit").value, False)
++        self.assertNotIn("secret-token-value", repr(at.session_state))
++
++    def test_admin_mode_is_disabled_by_default_and_accepts_only_explicit_truthy_values(self):
++        self.assertFalse(admin_mode_enabled(None))
++        self.assertFalse(admin_mode_enabled("false"))
++        self.assertTrue(admin_mode_enabled("1"))
++        self.assertTrue(admin_mode_enabled("TRUE"))
++
++    def test_pipeline_requires_complete_data_before_factor_construction(self):
++        quality = {
++            "security_count": 300,
++            "latest_trade_date": date(2026, 8, 27),
++            "missing_latest_price_codes": ["000001.SZ"],
++            "missing_financial_codes": [],
++            "valuation_count": 100,
++            "is_complete": False,
++        }
++        rows = pipeline_steps([], quality)
++        factors = next(row for row in rows if row["id"] == "factors")
++        self.assertEqual(factors["state"], "待执行")
++        self.assertFalse(factors["can_run"])
++        self.assertIn("完整性", factors["next_step"])
++
++    def test_freshness_contract_marks_all_covered_data_stale_after_expected_trade_day(self):
++        """Ignoring a completed trade day after the latest price would permit stale factor work."""
++        freshness = getattr(admin, "data_is_stale", None)
++        self.assertIsNotNone(freshness, "admin freshness contract must be public and pure")
++        if freshness is None:
++            return
++        self.assertTrue(
++            freshness(
++                date(2026, 8, 27),
++                today=date(2026, 8, 29),
++                is_trade_day=lambda day: day == date(2026, 8, 28),
++            )
++        )
++
++    def test_freshness_contract_keeps_fresh_prior_session_when_calendar_has_no_completed_day(self):
++        """A prior session must not be called stale when the calendar reports no completed day."""
++        freshness = getattr(admin, "data_is_stale", None)
++        self.assertIsNotNone(freshness, "admin freshness contract must be public and pure")
++        if freshness is None:
++            return
++        self.assertFalse(
++            freshness(
++                date(2026, 8, 27),
++                today=date(2026, 8, 29),
++                is_trade_day=lambda day: False,
++            )
++        )
++
++    def test_pipeline_requires_resync_before_factors_when_all_coverage_is_stale(self):
++        """Treating all-covered but stale data as complete would enable an invalid factor build."""
++        quality = {
++            "security_count": 300,
++            "latest_trade_date": date(2026, 8, 27),
++            "missing_latest_price_codes": [],
++            "missing_financial_codes": [],
++            "valuation_count": 300,
++            "is_complete": True,
++            "is_stale": True,
++        }
++        rows = pipeline_steps([], quality)
++        quality_row = next(row for row in rows if row["id"] == "quality")
++        factors = next(row for row in rows if row["id"] == "factors")
++        self.assertEqual(quality_row["state"], "需要处理")
++        self.assertIn("重新同步", quality_row["summary"])
++        self.assertIn("重新同步", quality_row["next_step"])
++        self.assertFalse(factors["can_run"])
++
++    def test_admin_renderer_blocks_factors_for_all_covered_stale_data(self):
++        """Dropping the UI freshness projection would re-enable factors for old but covered data."""
++        at = self._admin_app("stale")
++
++        self.assertEqual(len(at.exception), 0)
++        self.assertTrue(at.button(key="admin_factors_submit").disabled)
++        rendered = "\n".join(
++            str(element.value)
++            for elements in (at.subheader, at.markdown, at.caption)
++            for element in elements
++        )
++        self.assertIn("重新同步", rendered)
++
++    def test_admin_renderer_allows_factors_for_fresh_prior_session(self):
++        """A no-trade-day prior session must not become a false stale-data lockout."""
++        at = self._admin_app("enabled")
++
++        self.assertEqual(len(at.exception), 0)
++        self.assertFalse(at.button(key="admin_factors_submit").disabled)
++
++    def test_admin_renderer_accepts_fixed_clock_for_deterministic_freshness(self):
++        """Removing clock injection would make fixture freshness depend on the wall clock."""
++        parameter = inspect.signature(render_admin_workbench).parameters.get("today")
++
++        self.assertIsNotNone(parameter)
++        self.assertIsNone(parameter.default)
++
++    def test_completed_factor_run_unlocks_model_generation(self):
++        quality = {
++            "security_count": 300,
++            "latest_trade_date": date(2026, 8, 27),
++            "missing_latest_price_codes": [],
++            "missing_financial_codes": [],
++            "valuation_count": 10,
++            "is_complete": True,
++        }
++        runs = [
++            {
++                "run_id": "factor-1",
++                "run_type": "factors",
++                "status": "completed",
++                "parameters": {},
++                "payload": {"metadata": {"date_end": "2026-08-27"}},
++                "error": None,
++            }
++        ]
++        rows = pipeline_steps(runs, quality)
++        model = next(row for row in rows if row["id"] == "model")
++        self.assertTrue(model["can_run"])
++        self.assertEqual(model["prerequisite_run_id"], "factor-1")
++
++    def test_pipeline_rows_have_stable_shape_and_quality_has_no_run_button(self):
++        quality = {
++            "security_count": 300,
++            "latest_trade_date": date(2026, 8, 27),
++            "missing_latest_price_codes": [],
++            "missing_financial_codes": [],
++            "valuation_count": 100,
++            "is_complete": True,
++        }
++        expected_keys = {
++            "id",
++            "title",
++            "state",
++            "summary",
++            "next_step",
++            "can_run",
++            "run_id",
++            "prerequisite_run_id",
++            "progress",
++        }
++        rows = pipeline_steps([], quality)
++        self.assertEqual([row["id"] for row in rows], ["sync", "quality", "factors", "model"])
++        for row in rows:
++            self.assertEqual(set(row), expected_keys)
++        quality_row = next(row for row in rows if row["id"] == "quality")
++        self.assertEqual(quality_row["state"], "已完成")
++        self.assertFalse(quality_row["can_run"])
++
++    def test_admin_audit_filters_by_type_and_status(self):
++        runs = [
++            {"run_id": "s1", "run_type": "sync", "status": "failed"},
++            {"run_id": "f1", "run_type": "factors", "status": "completed"},
++        ]
++        self.assertEqual([row["run_id"] for row in filter_admin_runs(runs, "sync", "failed")], ["s1"])
++
++    def test_retry_parameters_never_include_token_or_database_url(self):
++        run = {
++            "run_type": "sync",
++            "status": "failed",
++            "parameters": {
++                "start_date": "2026-01-01",
++                "end_date": "2026-08-27",
++                "token": "secret",
++                "database_url": "postgresql://user:pass@host/db",
++            },
++        }
++        self.assertEqual(
++            retry_parameters(run),
++            {"start_date": date(2026, 1, 1), "end_date": date(2026, 8, 27)},
++        )
++
++    def test_sensitive_text_is_redacted_before_admin_display(self):
++        value = "request failed token=abc123 postgresql://user:pass@db.example/quant"
++        clean = redact_sensitive_text(value)
++        self.assertNotIn("abc123", clean)
++        self.assertNotIn("user:pass", clean)
++        self.assertIn("[已隐藏]", clean)
++
++    def test_sensitive_text_redacts_whitespace_delimited_secret_values(self):
++        clean = redact_sensitive_text("Token abc123 password hunter2")
++        self.assertNotIn("abc123", clean)
++        self.assertNotIn("hunter2", clean)
++
++    def test_sensitive_text_redacts_tushare_token_environment_name(self):
++        clean = redact_sensitive_text("sync failed TUSHARE_TOKEN=abc123")
++        self.assertNotIn("abc123", clean)
++
++    def test_sensitive_text_redacts_database_url_with_empty_username(self):
++        clean = redact_sensitive_text("connection failed postgresql://:pass@host/db")
++        self.assertNotIn(":pass@", clean)
++        self.assertNotIn("pass", clean)
++
++    def test_sensitive_text_redacts_entire_dsn_value_before_browser_output(self):
++        clean = redact_sensitive_text(
++            "sync failed dsn=postgresql://user:pass@db.example/private-research"
++        )
++        self.assertNotIn("postgresql://", clean)
++        self.assertNotIn("db.example", clean)
++        self.assertNotIn("private-research", clean)
++        self.assertIn("dsn=[已隐藏]", clean)
++
++    def test_retry_parameters_support_factor_and_model_dates_and_references(self):
++        factors = {
++            "run_type": "factors",
++            "status": "failed",
++            "parameters": {"as_of_dates": ["2026-08-26", date(2026, 8, 27)], "mode": "unsafe"},
++        }
++        model = {
++            "run_type": "model",
++            "status": "failed",
++            "parameters": {
++                "factor_run_id": "factor-1",
++                "prediction_dates": ["2026-08-27"],
++                "label": "20d_hs300_excess_return",
++            },
++        }
++        self.assertEqual(
++            retry_parameters(factors),
++            {"as_of_dates": [date(2026, 8, 26), date(2026, 8, 27)]},
++        )
++        self.assertEqual(
++            retry_parameters(model),
++            {"factor_run_id": "factor-1", "prediction_dates": [date(2026, 8, 27)]},
++        )
++        self.assertIsNone(retry_parameters({"run_type": "sync", "status": "completed", "parameters": {}}))
++        self.assertIsNone(retry_parameters({"run_type": "backtest", "status": "failed", "parameters": {}}))
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-3-before/test_quant_mvp.py	2026-08-29 09:40:52
++++ tests/test_quant_mvp.py	2026-08-29 09:55:54
+@@ -1,15 +1,25 @@
+ import unittest
+ from datetime import date
++import os
+ from pathlib import Path
+ import subprocess
+ import sys
+ from unittest.mock import patch
+ 
++from streamlit.testing.v1 import AppTest
++
+ from quant.backtest import BacktestConfig, run_backtest
+ from quant.factors import FactorEngine
+ from quant.model import ModelTrainer, export_qlib
+ from quant.pit import PITRepository
+-from quant.presentation import format_metric, sanitize_display_rows, status_feedback
++from quant.presentation import (
++    format_metric,
++    public_run_feedback,
++    public_run_label,
++    public_run_rows,
++    sanitize_display_rows,
++    status_feedback,
++)
+ from quant.providers import FixtureProvider
+ from quant.storage import InMemoryStore
+ 
+@@ -94,6 +104,73 @@
+         result = subprocess.run([sys.executable, "-m", "py_compile", "streamlit_app.py"], capture_output=True, text=True)
+         self.assertEqual(result.returncode, 0, result.stderr)
+ 
++    def test_public_run_presentation_hides_run_ids_and_stored_failures(self):
++        """Public labels, feedback, and history rows must not disclose operational values."""
++        failed = {
++            "run_id": "run-secret-123",
++            "run_type": "model",
++            "status": "failed",
++            "error": "connection dsn=postgresql://user:pass@db.example/private-research",
++        }
++        completed = {"run_id": "run-secret-456", "run_type": "backtest", "status": "completed"}
++
++        self.assertEqual(public_run_label(failed), "模型研究 · 失败")
++        self.assertEqual(
++            public_run_feedback(failed, "模型研究已完成。"),
++            ("error", "模型研究未能完成。请稍后重试或联系管理员。"),
++        )
++        self.assertEqual(
++            public_run_feedback(completed, "历史回测已完成。"),
++            ("success", "历史回测已完成。"),
++        )
++        rows = public_run_rows([failed, completed])
++        self.assertEqual(
++            rows,
++            [
++                {"研究类型": "模型研究", "状态": "失败"},
++                {"研究类型": "历史回测", "状态": "已完成"},
++            ],
++        )
++        rendered = repr(rows) + public_run_label(failed) + public_run_feedback(failed, "")[1]
++        for forbidden in ("run-secret-123", "run-secret-456", "postgresql://", "db.example", "private-research"):
++            self.assertNotIn(forbidden, rendered)
++
++    def test_streamlit_entrypoint_gates_navigation_and_database_copy_by_audience(self):
++        """The no-database entrypoint keeps public output operationally safe."""
++        def run_entrypoint(admin_mode: str):
++            with patch.dict(
++                os.environ,
++                {"QUANT_ADMIN_MODE": admin_mode},
++                clear=True,
++            ):
++                return AppTest.from_file(str(Path(__file__).parents[1] / "streamlit_app.py")).run(timeout=10)
++
++        public = run_entrypoint("false")
++        self.assertEqual(len(public.exception), 0)
++        self.assertEqual(
++            public.sidebar.radio[0].options,
++            ["今日机会", "股票池", "个股研究", "行业景气", "策略实验室", "组合", "回测", "数据状态"],
++        )
++        public_output = "\n".join(
++            str(element.value) for elements in (public.markdown, public.caption) for element in elements
++        )
++        self.assertIn("研究数据正在准备", public_output)
++        self.assertIn("请稍后刷新页面。", public_output)
++        for forbidden in ("DATABASE_URL", "PostgreSQL", "Tushare Token", "管理员"):
++            self.assertNotIn(forbidden, public_output)
++
++        admin = run_entrypoint("true")
++        self.assertEqual(len(admin.exception), 0)
++        self.assertEqual(
++            admin.sidebar.radio[0].options,
++            ["今日机会", "股票池", "个股研究", "行业景气", "策略实验室", "组合", "回测", "数据状态", "管理员"],
++        )
++        admin_output = "\n".join(
++            str(element.value) for elements in (admin.markdown, admin.caption) for element in elements
++        )
++        self.assertIn("尚未连接研究数据库", admin_output)
++        self.assertIn("请在部署环境配置 DATABASE_URL。", admin_output)
++
+     def test_streamlit_app_uses_research_summary_helpers(self):
+         source = Path("streamlit_app.py").read_text(encoding="utf-8")
+         self.assertIn("data_quality_summary", source)
+@@ -136,7 +213,17 @@
+         self.assertIn("因子", status_feedback(not_trainable, "模型已完成")[1])
+         self.assertEqual(status_feedback({"run_type": "model", "status": "completed"}, "模型已完成"), ("success", "模型已完成"))
+         self.assertEqual(status_feedback({"run_type": "factors", "status": "not_trainable"}, "因子运行已完成")[0], "warning")
+-        self.assertEqual(status_feedback({"run_type": "factors", "status": "failed", "error": "数据源错误"}, "因子运行已完成"), ("error", "数据源错误"))
++        self.assertEqual(
++            status_feedback(
++                {
++                    "run_type": "factors",
++                    "status": "failed",
++                    "error": "dsn=postgresql://user:pass@db.example/research",
++                },
++                "因子运行已完成",
++            ),
++            ("error", "因子构建未能完成。请稍后重试或联系管理员。"),
++        )
+ 
+     def test_model_falls_back_when_lightgbm_shared_library_cannot_load(self):
+         engine = FactorEngine(PITRepository(self.store))
+--- /dev/null	2026-08-29 10:41:56
++++ tests/fixtures/admin_workbench_app.py	2026-08-29 10:39:33
+@@ -0,0 +1,136 @@
++from datetime import date
++import os
++from types import SimpleNamespace
++
++import streamlit as st
++
++import quant.admin_ui as admin_ui
++from quant.admin_ui import render_admin_workbench
++
++
++MODE = os.getenv("ADMIN_FIXTURE_MODE", "guarded")
++FIXTURE_TODAY = date(2026, 8, 29)
++
++
++def _completed_factor(run_id, day):
++    return {
++        "run_id": run_id,
++        "run_type": "factors",
++        "status": "completed",
++        "parameters": {"as_of_dates": [day]},
++        "payload": {"metadata": {"date_end": day.isoformat()}},
++        "error": None,
++        "created_at": f"{day.isoformat()}T00:00:00+00:00",
++        "completed_at": f"{day.isoformat()}T00:01:00+00:00",
++    }
++
++
++class FakeAdminStore:
++    def __init__(self):
++        self.factor_dates = []
++        self.model_factor_run_id = None
++        self.runs = self._initial_runs()
++
++    def _initial_runs(self):
++        failed_sync = {
++            "run_id": "failed-sync-1",
++            "run_type": "sync",
++            "status": "failed",
++            "parameters": {"start_date": "2026-08-01", "end_date": "2026-08-27"},
++            "payload": {},
++            "error": "provider rejected token=secret-token-value",
++            "created_at": "2026-08-28T00:00:00+00:00",
++            "completed_at": "2026-08-28T00:01:00+00:00",
++        }
++        if MODE == "model-retry":
++            return [
++                {
++                    "run_id": "failed-model-1",
++                    "run_type": "model",
++                    "status": "failed",
++                    "parameters": {
++                        "factor_run_id": "factor-retry",
++                        "prediction_dates": ["2026-08-27"],
++                    },
++                    "payload": {},
++                    "error": "model failure dsn=postgresql://user:pass@db.example/research",
++                    "created_at": "2026-08-28T03:00:00+00:00",
++                    "completed_at": "2026-08-28T03:01:00+00:00",
++                },
++                _completed_factor("factor-newest", date(2026, 8, 27)),
++                _completed_factor("factor-retry", date(2026, 8, 26)),
++            ]
++        return [failed_sync] if MODE == "guarded" else [_completed_factor("factor-newest", date(2026, 8, 27))]
++
++    def data_quality(self, universe):
++        assert universe == "hs300"
++        return {
++            "security_count": 300,
++            "latest_trade_date": date(2026, 8, 27),
++            "missing_latest_price_codes": ["000001.SZ"] if MODE == "guarded" else [],
++            "missing_financial_codes": [],
++            "valuation_count": 300,
++            "is_complete": MODE != "guarded",
++        }
++
++    def fast_counts(self):
++        return {"securities": 300, "prices": 6000, "financials": 300, "valuation_count": 300}
++
++    def fail_stale_sync_runs(self):
++        return 0
++
++    def is_trade_day(self, day):
++        return MODE == "stale" and day.weekday() < 5
++
++    def list_runs(self, limit=100):
++        return self.runs[:limit]
++
++    def get_run(self, run_id):
++        return next(run for run in self.runs if run["run_id"] == run_id)
++
++    def load_memory(self):
++        return SimpleNamespace(
++            prices={
++                ("000001.SZ", date(2026, 8, 25)): SimpleNamespace(trade_date=date(2026, 8, 25)),
++                ("000001.SZ", date(2026, 8, 26)): SimpleNamespace(trade_date=date(2026, 8, 26)),
++                ("000001.SZ", date(2026, 8, 27)): SimpleNamespace(trade_date=date(2026, 8, 27)),
++            }
++        )
++
++
++def _fake_sync(store, token, start, end, progress):
++    assert token == os.environ["TUSHARE_TOKEN"]
++    store.runs.insert(0, {
++        "run_id": "sync-completed", "run_type": "sync", "status": "completed",
++        "parameters": {"start_date": start, "end_date": end}, "payload": {}, "error": None,
++        "created_at": "2026-08-28T04:00:00+00:00", "completed_at": "2026-08-28T04:01:00+00:00",
++    })
++    return "sync-completed"
++
++
++def _fake_build_factor(store, dates):
++    store.factor_dates = list(dates)
++    store.runs.insert(0, _completed_factor("factor-created", dates[-1]))
++    return "factor-created"
++
++
++def _fake_train_model(store, factor_run_id, prediction_dates):
++    store.model_factor_run_id = factor_run_id
++    store.runs.insert(0, {
++        "run_id": "model-completed", "run_type": "model", "status": "completed",
++        "parameters": {"factor_run_id": factor_run_id, "prediction_dates": prediction_dates},
++        "payload": {}, "error": None,
++        "created_at": "2026-08-28T04:00:00+00:00", "completed_at": "2026-08-28T04:01:00+00:00",
++    })
++    return "model-completed"
++
++
++admin_ui.sync_hs300 = _fake_sync
++admin_ui.build_factor_run = _fake_build_factor
++admin_ui.train_model_run = _fake_train_model
++store = FakeAdminStore()
++render_admin_workbench(st, store, today=FIXTURE_TODAY)
++if store.factor_dates:
++    st.caption("测试因子日期：" + ",".join(day.isoformat() for day in store.factor_dates))
++if store.model_factor_run_id:
++    st.caption("测试模型因子运行：" + store.model_factor_run_id)
+--- /dev/null	2026-08-29 10:41:56
++++ tests/fixtures/public_status_app.py	2026-08-29 09:52:44
+@@ -0,0 +1,20 @@
++import streamlit as st
++
++from quant.public_status_ui import render_public_data_status
++
++
++render_public_data_status(
++    st,
++    quality={"latest_trade_date": "2026-08-27"},
++    counts={"securities": 300, "prices": 600, "financials": 300, "valuation_count": 300},
++    runs=[
++        {"run_id": "run-secret-123", "run_type": "sync", "status": "completed"},
++        {"run_id": "run-secret-456", "run_type": "factors", "status": "completed"},
++        {
++            "run_id": "run-secret-789",
++            "run_type": "factors",
++            "status": "failed",
++            "error": "dsn=postgresql://user:pass@db.example/research",
++        },
++    ],
++)
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-4-before/README.md	2026-08-29 09:59:45
++++ README.md	2026-08-29 10:11:20
+@@ -10,20 +10,30 @@
+ - 每月调仓的 Top-N 多头回测，包含交易成本、可交易性过滤、持仓和调仓记录。
+ - Streamlit 页面：总览、数据管理、个股数据、因子研究、模型训练、策略配置、回测、运行记录。
+ 
+-## 前置条件
++## 受控管理员部署前置条件
+ 
+ - Python 3.11+、PostgreSQL 16+，以及有效的 Tushare Token。
+ - 财务指标接口按单股请求；Token 的积分、频率和 VIP 权限决定可用数据范围。Token 不会写入数据库。
+ 
++## 管理员工作台
++
++管理员工作台默认关闭。仅在受控部署中设置 `QUANT_ADMIN_MODE=1`，然后重启 Streamlit。普通用户部署不要设置该变量。
++
++`QUANT_ADMIN_MODE` 只是部署开关，不是登录或权限系统。如需同时提供公开页面与管理页面，请使用两个部署实例，并只在内部实例启用管理员模式。
++
++管理员工作台按“数据同步 → 完整性检查 → 因子构建 → 模型生成”执行。Tushare Token 只从密码输入或 `TUSHARE_TOKEN` 环境变量读取，不写入数据库。
++
++公开实例面向普通用户：不配置 `DATABASE_URL` 或 Tushare Token，也不显示管理员入口、数据库配置或 Token 指引。数据库连接和 Token 仅由受控内部管理员部署的运维人员配置；不要把这些值保存、打印或传给普通用户。
++
+ ## Docker Compose
+ 
+ ```bash
+ cp .env.example .env
+-# 在 .env 填写 TUSHARE_TOKEN，并按需修改 POSTGRES_PASSWORD
++# 仅内部管理员实例：在 .env 填写 TUSHARE_TOKEN、QUANT_ADMIN_MODE=1，并按需修改 POSTGRES_PASSWORD
+ docker compose up --build
+ ```
+ 
+-打开 `http://localhost:8501`，在侧栏填写 `DATABASE_URL`（Compose 默认值：`postgresql+psycopg://quant:quant@postgres:5432/quant`）。首次在“数据管理”同步数据。
++上述 Compose 配置用于受控的内部管理员部署；数据库连接由服务环境提供，而非在侧栏输入。设置 `QUANT_ADMIN_MODE=1` 后打开 `http://localhost:8501`，在“管理员”页面完成首次数据同步。公开部署应作为独立实例运行，且不要设置管理员开关、数据库连接或 Token。
+ 
+ CLI 同步/研究任务可由 cron 调用：
+ 
+@@ -36,12 +46,15 @@
+ 
+ ## 本机运行
+ 
++以下命令仅用于受控的内部管理员部署，不适用于普通用户的公开页面：
++
+ ```bash
+ python -m venv .venv
+ . .venv/bin/activate
+ pip install -e .
+ export DATABASE_URL='postgresql://quant:quant@localhost:5432/quant'
+ export TUSHARE_TOKEN='你的 Token'
++export QUANT_ADMIN_MODE=1
+ python -m quant.cli init-db
+ python -m quant.cli sync-hs300 --start-date 2024-01-01 --end-date 2025-01-01
+ streamlit run streamlit_app.py
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-4-fix1-before/docker-compose.yml	2026-08-29 10:08:33
++++ docker-compose.yml	2026-08-29 10:11:20
+@@ -13,6 +13,7 @@
+     environment:
+       DATABASE_URL: postgresql+psycopg://quant:${POSTGRES_PASSWORD:-quant}@postgres:5432/quant
+       TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
++      QUANT_ADMIN_MODE: ${QUANT_ADMIN_MODE:-}
+     ports: ["8501:8501"]
+     depends_on: [postgres]
+   quant:
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-4-fix1-before/.env.example	2026-08-29 10:08:33
++++ .env.example	2026-08-29 10:11:20
+@@ -1,3 +1,4 @@
+ TUSHARE_TOKEN=
++QUANT_ADMIN_MODE=
+ POSTGRES_PASSWORD=quant
+ DATABASE_URL=postgresql://quant:quant@localhost:5432/quant

@@ -1,0 +1,34 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: quant
+      POSTGRES_USER: quant
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quant}
+    ports: ["5432:5432"]
+    volumes: ["./data/postgres:/var/lib/postgresql/data"]
+  streamlit:
+    build: .
+    command: streamlit run streamlit_app.py --server.address=0.0.0.0
+    environment:
+      DATABASE_URL: postgresql+psycopg://quant:${POSTGRES_PASSWORD:-quant}@postgres:5432/quant
+      TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
+    ports: ["8501:8501"]
+    depends_on: [postgres]
+  quant:
+    build: .
+    profiles: ["jobs"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://quant:${POSTGRES_PASSWORD:-quant}@postgres:5432/quant
+      TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
+    depends_on: [postgres]
+    entrypoint: ["python", "-m", "quant.cli"]
+  scheduler:
+    build: .
+    entrypoint: ["python", "-m", "quant.cli"]
+    command: ["run-scheduler"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://quant:${POSTGRES_PASSWORD:-quant}@postgres:5432/quant
+      TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
+      TZ: Asia/Shanghai
+    depends_on: [postgres]

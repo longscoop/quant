@@ -1,0 +1,53 @@
+Expected task files:
+- README.md
+
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-4-before/README.md	2026-08-29 09:59:45
++++ README.md	2026-08-29 10:05:19
+@@ -10,11 +10,21 @@
+ - 每月调仓的 Top-N 多头回测，包含交易成本、可交易性过滤、持仓和调仓记录。
+ - Streamlit 页面：总览、数据管理、个股数据、因子研究、模型训练、策略配置、回测、运行记录。
+ 
+-## 前置条件
++## 受控管理员部署前置条件
+ 
+ - Python 3.11+、PostgreSQL 16+，以及有效的 Tushare Token。
+ - 财务指标接口按单股请求；Token 的积分、频率和 VIP 权限决定可用数据范围。Token 不会写入数据库。
+ 
++## 管理员工作台
++
++管理员工作台默认关闭。仅在受控部署中设置 `QUANT_ADMIN_MODE=1`，然后重启 Streamlit。普通用户部署不要设置该变量。
++
++`QUANT_ADMIN_MODE` 只是部署开关，不是登录或权限系统。如需同时提供公开页面与管理页面，请使用两个部署实例，并只在内部实例启用管理员模式。
++
++管理员工作台按“数据同步 → 完整性检查 → 因子构建 → 模型生成”执行。Tushare Token 只从密码输入或 `TUSHARE_TOKEN` 环境变量读取，不写入数据库。
++
++公开实例面向普通用户：不配置 `DATABASE_URL` 或 Tushare Token，也不显示管理员入口、数据库配置或 Token 指引。数据库连接和 Token 仅由受控内部管理员部署的运维人员配置；不要把这些值保存、打印或传给普通用户。
++
+ ## Docker Compose
+ 
+ ```bash
+@@ -23,7 +33,7 @@
+ docker compose up --build
+ ```
+ 
+-打开 `http://localhost:8501`，在侧栏填写 `DATABASE_URL`（Compose 默认值：`postgresql+psycopg://quant:quant@postgres:5432/quant`）。首次在“数据管理”同步数据。
++上述 Compose 配置用于受控的内部管理员部署；数据库连接由服务环境提供，而非在侧栏输入。设置 `QUANT_ADMIN_MODE=1` 后打开 `http://localhost:8501`，在“管理员”页面完成首次数据同步。公开部署应作为独立实例运行，且不要设置管理员开关、数据库连接或 Token。
+ 
+ CLI 同步/研究任务可由 cron 调用：
+ 
+@@ -36,12 +46,15 @@
+ 
+ ## 本机运行
+ 
++以下命令仅用于受控的内部管理员部署，不适用于普通用户的公开页面：
++
+ ```bash
+ python -m venv .venv
+ . .venv/bin/activate
+ pip install -e .
+ export DATABASE_URL='postgresql://quant:quant@localhost:5432/quant'
+ export TUSHARE_TOKEN='你的 Token'
++export QUANT_ADMIN_MODE=1
+ python -m quant.cli init-db
+ python -m quant.cli sync-hs300 --start-date 2024-01-01 --end-date 2025-01-01
+ streamlit run streamlit_app.py

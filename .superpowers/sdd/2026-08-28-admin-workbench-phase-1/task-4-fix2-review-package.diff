@@ -1,0 +1,74 @@
+Fix round 2 expected files:
+- quant/admin_ui.py
+- tests/fixtures/admin_workbench_app.py
+- tests/test_admin_workbench.py
+
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-4-fix2-before/admin_ui.py	2026-08-29 10:38:40
++++ quant/admin_ui.py	2026-08-29 10:39:33
+@@ -11,7 +11,7 @@
+ from .workflows import build_factor_run, sync_hs300, train_model_run
+ 
+ 
+-def render_admin_workbench(st, store) -> None:
++def render_admin_workbench(st, store, *, today: date | None = None) -> None:
+     """Render operational controls without treating the page as authentication."""
+     st.title("管理员工作台")
+     st.caption("准备研究数据、执行研究流水线并诊断失败任务。")
+@@ -24,7 +24,7 @@
+     quality = dict(store.data_quality("hs300"))
+     quality["is_stale"] = data_is_stale(
+         quality.get("latest_trade_date"),
+-        today=date.today(),
++        today=today or date.today(),
+         is_trade_day=store.is_trade_day,
+     )
+     counts = store.fast_counts()
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-4-fix2-before/admin_workbench_app.py	2026-08-29 10:38:40
++++ tests/fixtures/admin_workbench_app.py	2026-08-29 10:39:33
+@@ -9,6 +9,7 @@
+ 
+ 
+ MODE = os.getenv("ADMIN_FIXTURE_MODE", "guarded")
++FIXTURE_TODAY = date(2026, 8, 29)
+ 
+ 
+ def _completed_factor(run_id, day):
+@@ -128,7 +129,7 @@
+ admin_ui.build_factor_run = _fake_build_factor
+ admin_ui.train_model_run = _fake_train_model
+ store = FakeAdminStore()
+-render_admin_workbench(st, store)
++render_admin_workbench(st, store, today=FIXTURE_TODAY)
+ if store.factor_dates:
+     st.caption("测试因子日期：" + ",".join(day.isoformat() for day in store.factor_dates))
+ if store.model_factor_run_id:
+--- .superpowers/sdd/2026-08-28-admin-workbench-phase-1/task-4-fix2-before/test_admin_workbench.py	2026-08-29 10:38:40
++++ tests/test_admin_workbench.py	2026-08-29 10:39:16
+@@ -1,4 +1,5 @@
+ import unittest
++import inspect
+ from datetime import date
+ import os
+ from pathlib import Path
+@@ -17,6 +18,7 @@
+     retry_parameters,
+ )
+ from quant.public_status_ui import public_status_rows
++from quant.admin_ui import render_admin_workbench
+ 
+ 
+ class AdminWorkbenchTests(unittest.TestCase):
+@@ -242,6 +244,13 @@
+         self.assertEqual(len(at.exception), 0)
+         self.assertFalse(at.button(key="admin_factors_submit").disabled)
+ 
++    def test_admin_renderer_accepts_fixed_clock_for_deterministic_freshness(self):
++        """Removing clock injection would make fixture freshness depend on the wall clock."""
++        parameter = inspect.signature(render_admin_workbench).parameters.get("today")
++
++        self.assertIsNotNone(parameter)
++        self.assertIsNone(parameter.default)
++
+     def test_completed_factor_run_unlocks_model_generation(self):
+         quality = {
+             "security_count": 300,

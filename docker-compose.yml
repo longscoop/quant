@@ -1,0 +1,52 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: quant
+      POSTGRES_USER: quant
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quant}
+    ports: ["5432:5432"]
+    volumes: ["./data/postgres:/var/lib/postgresql/data"]
+  streamlit:
+    build: .
+    image: a-share-quant:dev
+    command: streamlit run streamlit_app.py --server.address=0.0.0.0
+    environment:
+      DATABASE_URL: postgresql+psycopg://quant:${POSTGRES_PASSWORD:-quant}@postgres:5432/quant
+      TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
+      QUANT_ADMIN_MODE: ${QUANT_ADMIN_MODE:-}
+      QLIB_ARTIFACT_ROOT: /app/data/qlib
+    volumes: ["./data/qlib:/app/data/qlib"]
+    ports: ["8501:8501"]
+    depends_on: [postgres]
+  api:
+    image: a-share-quant:dev
+    command: uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
+    environment:
+      DATABASE_URL: postgresql+psycopg://quant:${POSTGRES_PASSWORD:-quant}@postgres:5432/quant
+      QUANT_CORS_ORIGINS: ${QUANT_CORS_ORIGINS:-http://localhost:5173}
+    ports: ["8000:8000"]
+    depends_on: [postgres]
+  frontend:
+    build: ./frontend
+    ports: ["5173:80"]
+    depends_on: [api]
+  quant:
+    image: a-share-quant:dev
+    profiles: ["jobs"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://quant:${POSTGRES_PASSWORD:-quant}@postgres:5432/quant
+      TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
+      QLIB_ARTIFACT_ROOT: /app/data/qlib
+    volumes: ["./data/qlib:/app/data/qlib"]
+    depends_on: [postgres]
+    entrypoint: ["python", "-m", "quant.cli"]
+  scheduler:
+    image: a-share-quant:dev
+    entrypoint: ["python", "-m", "quant.cli"]
+    command: ["run-scheduler"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://quant:${POSTGRES_PASSWORD:-quant}@postgres:5432/quant
+      TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
+      TZ: Asia/Shanghai
+    depends_on: [postgres]

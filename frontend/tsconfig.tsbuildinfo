@@ -1,0 +1,1 @@
+{"root":["./src/main.tsx","./src/vite-env.d.ts","./src/api/client.ts","./src/api/research.ts","./src/app/app.tsx","./src/features/research/candidatepoolpage.tsx","./src/features/research/researchhomepage.tsx","./src/features/research/research.test.tsx","./src/test/setup.ts"],"version":"5.7.2"}

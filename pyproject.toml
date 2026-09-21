@@ -1,0 +1,33 @@
+[project]
+name = "a-share-quant"
+version = "0.1.0"
+description = "Point-in-time A-share quantitative research MVP"
+requires-python = ">=3.11"
+dependencies = [
+  "pandas>=2.2",
+  "numpy>=1.26",
+  "SQLAlchemy>=2.0",
+  "psycopg[binary]>=3.2",
+  "tushare>=1.4",
+  "requests>=2.31",
+  "lightgbm>=4.5",
+  "pyqlib==0.9.7",
+  "mlflow==1.27.0",
+  "protobuf==5.29.5",
+  "vectorbt>=0.27",
+  "streamlit>=1.38",
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "httpx>=0.27",
+  "typer>=0.12",
+]
+
+[project.scripts]
+quant = "quant.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["quant*"]
+exclude = ["data*", "tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
