@@ -1145,8 +1145,8 @@ def run_factor_backtest_run(
             if progress:
                 progress({"event": "snapshot_check", "current": current, "total": total, "date": day, "status": "reused" if existing else "missing"})
             snapshot = ensure_factor_snapshot(store, day, factor_version=FACTOR_MODEL_VERSION, pit_version=PIT_DATA_VERSION, universe_version=universe_version, memory=memory)
-            if snapshot.get("status") != "completed":
-                event = {"event": "snapshot_failed", "current": current, "total": total, "date": day, "reason": "PIT 因子快照未生成可用项目"}
+            if snapshot.get("status") not in {"completed", "degraded"}:
+                event = {"event": "snapshot_failed", "current": current, "total": total, "date": day, "reason": "PIT 因子快照覆盖率不足 80%"}
                 snapshot_events.append(event)
                 if progress:
                     progress(event)

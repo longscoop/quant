@@ -9,12 +9,20 @@ from .markets import MarketConfig, ResearchContext
 from .scoring import FACTOR_MODEL_VERSION, PIT_DATA_VERSION
 
 
+def classify_snapshot_coverage(coverage: float) -> tuple[str, str]:
+    if coverage >= 0.90:
+        return "completed", "VALID"
+    if coverage >= 0.80:
+        return "degraded", "DEGRADED"
+    return "invalid", "INVALID"
+
+
 def ensure_factor_snapshot(
     store,
     as_of_date: date,
     *,
-    factor_version: str = "pit_v1.0",
-    pit_version: str = "pit_v1.0",
+    factor_version: str = FACTOR_MODEL_VERSION,
+    pit_version: str = PIT_DATA_VERSION,
     universe_version: str = "hs300:all",
     memory=None,
     context: ResearchContext | None = None,
@@ -47,10 +55,38 @@ def ensure_factor_snapshot(
             items.append({"ts_code": ranking["ts_code"], "factors": factors, "availability": availability, "audit": {"as_of_date": ranking.get("as_of_date"), "tradable_date": ranking.get("tradable_date")}})
         data_gap_reasons = {"unknown_security", "missing_price", "missing_visible_financial"}
         missing_inputs = {code: reason for code, reason in pit_snapshot.exclusions.items() if reason in data_gap_reasons}
-        candidate_count = len(items) + len(missing_inputs)
-        coverage = len(items) / candidate_count if candidate_count else 0.0
-        status = "completed" if items and not missing_inputs else "partial"
-        snapshot = {"as_of_date": as_of_date, "factor_version": factor_version, "pit_version": pit_version, "universe_version": universe_version, "status": status, "coverage": coverage, "audit": {"security_count": len(items), "candidate_count": candidate_count, "missing_input_count": len(missing_inputs), "missing_input_reasons": missing_inputs, "ranking_source": "pit_factor_dimensions"}}
+        exclusion_counts = {}
+        for reason in pit_snapshot.exclusions.values():
+            exclusion_counts[reason] = exclusion_counts.get(reason, 0) + 1
+
+        tradable_count = len(pit_snapshot.universe)
+        scored_count = sum(1 for item in items if any((item.get("availability") or {}).values()))
+        candidate_count = tradable_count + len(missing_inputs)
+        coverage = scored_count / candidate_count if candidate_count else 0.0
+        status, quality_state = classify_snapshot_coverage(coverage)
+        if not items:
+            status, quality_state = "invalid", "INVALID"
+        snapshot = {
+            "as_of_date": as_of_date,
+            "factor_version": factor_version,
+            "pit_version": pit_version,
+            "universe_version": universe_version,
+            "status": status,
+            "coverage": coverage,
+            "audit": {
+                "security_count": len(items),
+                "eligible_count": candidate_count,
+                "tradable_count": tradable_count,
+                "scored_count": scored_count,
+                "candidate_count": candidate_count,
+                "missing_input_count": len(missing_inputs),
+                "missing_input_reasons": missing_inputs,
+                "exclusion_counts": exclusion_counts,
+                "quality_state": quality_state,
+                "ranking_source": "pit_factor_dimensions",
+                "universe_quality": pit_snapshot.metadata.get("universe_quality"),
+            },
+        }
         if context is not None:
             snapshot.update(context.to_dict())
         snapshot_id = store.record_factor_snapshot(snapshot, items)
