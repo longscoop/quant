@@ -720,7 +720,12 @@ def train_model_run(
         "factor_run_id": factor_run_id,
         "context": context.to_dict(),
         "time_split": split.to_dict(),
-        "label": {"kind": "forward_excess_return", "horizon": split.label_horizon, "benchmark_id": context.benchmark_id},
+        "label": {
+            "kind": "forward_excess_return",
+            "definition": "T+1_OPEN_TO_T+20_CLOSE_EXCESS",
+            "horizon": split.label_horizon,
+            "benchmark_id": context.benchmark_id,
+        },
     }
     try:
         config = market_config or get_market(context.market_id)
@@ -780,8 +785,36 @@ def train_model_run(
             experiment_name=recorder_experiment_name,
             recorder_name=factor_run_id,
         )
+        factor_metadata = (factor_run.get("payload") or {}).get("metadata") or {}
+        registry_contract = {
+            "schema_version": "model_run_v2",
+            "context": context.to_dict(),
+            "feature_snapshot": {
+                "run_id": factor_run_id,
+                "factor_model_version": factor_metadata.get("factor_model_version"),
+                "pit_version": factor_metadata.get("pit_version") or factor_metadata.get("data_version"),
+                "feature_columns": list(prepared.feature_columns),
+            },
+            "label": {
+                "definition": labeled.attrs.get("label_definition", "T+1_OPEN_TO_T+20_CLOSE_EXCESS"),
+                "horizon": split.label_horizon,
+                "benchmark_id": context.benchmark_id,
+            },
+            "split": {
+                "requested": split.to_dict(),
+                "effective": prepared.audit.get("split") or {},
+            },
+            "model_params": dict(result.metadata.get("model_params") or {}),
+            "artifacts": {
+                "recorder_id": record_result.recorder_id if record_result else None,
+                "experiment_name": recorder_experiment_name if record_result else None,
+                "paths": list(record_result.artifact_paths) if record_result else [],
+            },
+            "oos_metrics": dict(record_result.metrics) if record_result else {},
+        }
         metadata = {
             **result.metadata,
+            "registry_contract": registry_contract,
             "status": result.status,
             "status_reason": result.status_reason,
             "training_row_count": len(QlibModelEngine._segment(prepared.frame, prepared.segments["train"])),
