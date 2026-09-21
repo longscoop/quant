@@ -103,6 +103,7 @@ def execute_target_weights(
     tradability_provider: TradabilityProvider,
     cost_model: TransactionCostModel,
     lot_size_provider: LotSizeProvider,
+    execution_codes: set[str] | None = None,
 ) -> ExecutionBatch:
     """Execute one target portfolio at one market session.
 
@@ -165,8 +166,9 @@ def execute_target_weights(
     records: list[dict] = []
     gross_traded = 0.0
     total_cost = 0.0
+    executable = set(preparation) if execution_codes is None else set(preparation) & {str(code) for code in execution_codes}
     ordered_codes = sorted(
-        preparation,
+        executable,
         key=lambda code: (
             0 if preparation[code]["target"] < preparation[code]["current"] else 1,
             code,
