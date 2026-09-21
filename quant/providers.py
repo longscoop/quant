@@ -8,7 +8,7 @@ import time
 
 import requests
 
-from .types import BenchmarkBar, FinancialRecord, IndustryRecord, PriceBar, RawRecord, Security, ValuationBar
+from .types import BenchmarkBar, FinancialRecord, IndustryRecord, PriceBar, RawRecord, Security, SecurityStatusRecord, ValuationBar
 
 
 class DataProvider(ABC):
@@ -90,6 +90,7 @@ class TushareProvider(DataProvider):
         self._raw_financial_records: dict[str, list[RawRecord]] = {}
         self._raw_market_records: dict[str, list[RawRecord]] = {}
         self._raw_base_records: list[RawRecord] = []
+        self._reference_records: list[RawRecord] | None = None
         self.errors: list[dict[str, str]] = []
         self.windows = windows or {}
 
@@ -145,9 +146,14 @@ class TushareProvider(DataProvider):
                 listed = getattr(row, "list_date", None)
                 if not listed:
                     continue
-                records[row.ts_code] = Security(row.ts_code, row.name, date.fromisoformat(listed), market_id="CN", currency="CNY")
+                records[row.ts_code] = Security(row.ts_code, row.name, date.fromisoformat(listed), is_st=self._is_st_name(row.name), market_id="CN", currency="CNY")
                 self._raw_base_records.append(RawRecord("stock_basic", row.ts_code, self._source_payload(row)))
         return [record for code, record in sorted(records.items()) if not self.universe or code in self.universe]
+
+    @staticmethod
+    def _is_st_name(name: str | None) -> bool:
+        normalized = str(name or "").strip().upper()
+        return normalized.startswith(("ST", "*ST", "S*ST", "SST"))
 
     @staticmethod
     def _parse_source_date(value) -> date | None:
@@ -190,6 +196,8 @@ class TushareProvider(DataProvider):
 
     def fetch_reference_records(self) -> list[RawRecord]:
         """Collect slowly-changing company and calendar data for the configured pool."""
+        if self._reference_records is not None:
+            return list(self._reference_records)
         records: list[RawRecord] = []
         start, end = self.start_date.strftime("%Y%m%d"), self.end_date.strftime("%Y%m%d")
         if hasattr(self.pro, "stock_company"):
@@ -205,6 +213,28 @@ class TushareProvider(DataProvider):
             for exchange in ("SSE", "SZSE"):
                 for row in self._request("trade_cal", exchange=exchange, start_date=start, end_date=end).itertuples():
                     records.append(RawRecord("trade_cal", exchange, self._source_payload(row), report_period=self._parse_source_date(getattr(row, "cal_date", None))))
+        self._reference_records = list(records)
+        return records
+
+    def fetch_security_statuses(self) -> list[SecurityStatusRecord]:
+        records = []
+        for raw in self.fetch_reference_records():
+            if raw.dataset != "namechange" or not raw.ts_code:
+                continue
+            start = self._parse_source_date(raw.payload.get("start_date")) or raw.report_period
+            if start is None:
+                continue
+            end = self._parse_source_date(raw.payload.get("end_date"))
+            name = str(raw.payload.get("name") or "")
+            records.append(
+                SecurityStatusRecord(
+                    raw.ts_code,
+                    start,
+                    end,
+                    is_st=self._is_st_name(name),
+                    status_name=name or None,
+                )
+            )
         return records
 
     def fetch_trade_calendar(self, day: date, exchange: str = "SSE") -> list[RawRecord]:

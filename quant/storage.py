@@ -10,7 +10,7 @@ from math import isfinite
 import re
 from uuid import uuid4
 from .providers import DataProvider
-from .types import AuditRun, BenchmarkBar, FinancialRecord, IndustryRecord, PriceBar, RawRecord, Security, ValuationBar
+from .types import AuditRun, BenchmarkBar, FinancialRecord, IndustryRecord, PriceBar, RawRecord, Security, SecurityStatusRecord, ValuationBar
 
 
 _REDACTED = "[已隐藏]"
@@ -92,6 +92,7 @@ def sanitize_for_storage(value):
 
 POSTGRES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS securities (ts_code text PRIMARY KEY, name text NOT NULL, list_date date NOT NULL, is_st boolean NOT NULL DEFAULT false);
+CREATE TABLE IF NOT EXISTS security_statuses (ts_code text NOT NULL, effective_from date NOT NULL, effective_to date, is_st boolean NOT NULL DEFAULT false, status_name text, PRIMARY KEY (ts_code, effective_from));
 CREATE TABLE IF NOT EXISTS price_bars (ts_code text NOT NULL, trade_date date NOT NULL, close double precision NOT NULL, adj_factor double precision NOT NULL, suspended boolean NOT NULL, limit_up boolean NOT NULL, limit_down boolean NOT NULL, volume double precision NOT NULL, open double precision, high double precision, low double precision, PRIMARY KEY (ts_code, trade_date));
 CREATE TABLE IF NOT EXISTS financials (ts_code text NOT NULL, report_period date NOT NULL, ann_date date NOT NULL, revenue double precision NOT NULL, net_profit double precision NOT NULL, roe double precision NOT NULL, gross_margin double precision NOT NULL, operating_cashflow double precision NOT NULL, debt_ratio double precision NOT NULL, PRIMARY KEY (ts_code, report_period, ann_date));
 CREATE TABLE IF NOT EXISTS industries (ts_code text NOT NULL, industry text NOT NULL, effective_date date NOT NULL, PRIMARY KEY (ts_code, effective_date));
@@ -119,6 +120,7 @@ CREATE TABLE IF NOT EXISTS portfolio_cash_flows (cash_flow_id uuid PRIMARY KEY, 
 CREATE TABLE IF NOT EXISTS portfolio_daily_nav (portfolio_id text NOT NULL REFERENCES research_portfolios(portfolio_id), valuation_date date NOT NULL, cash double precision NOT NULL, market_value double precision, total_value double precision, nav double precision, benchmark_nav double precision, status text NOT NULL, coverage double precision, reason text, calculation_version text NOT NULL, updated_at timestamptz NOT NULL DEFAULT NOW(), PRIMARY KEY (portfolio_id, valuation_date));
 CREATE TABLE IF NOT EXISTS market_calendar_sessions (calendar_id text NOT NULL, trade_date date NOT NULL, is_open boolean NOT NULL, source text NOT NULL, updated_at timestamptz NOT NULL DEFAULT NOW(), PRIMARY KEY (calendar_id, trade_date));
 CREATE INDEX IF NOT EXISTS price_bars_code_date_idx ON price_bars (ts_code, trade_date DESC);
+CREATE INDEX IF NOT EXISTS security_statuses_code_effective_idx ON security_statuses (ts_code, effective_from DESC);
 CREATE INDEX IF NOT EXISTS industries_code_effective_idx ON industries (ts_code, effective_date DESC);
 CREATE INDEX IF NOT EXISTS source_records_dataset_code_idx ON source_records (dataset, ts_code);
 """
@@ -135,6 +137,7 @@ def _benchmark_rows_with_open(provider, ts_code: str) -> list[BenchmarkBar]:
 class InMemoryStore:
     def __init__(self):
         self.securities: dict[str, Security] = {}
+        self.security_statuses: dict[tuple[str, object], SecurityStatusRecord] = {}
         self.prices: dict[tuple[str, object], PriceBar] = {}
         self.financials: dict[tuple[str, object, object], FinancialRecord] = {}
         self.industries: dict[tuple[str, object], IndustryRecord] = {}
@@ -159,6 +162,11 @@ class InMemoryStore:
             for row in rows:
                 target[key(row)] = row
             self.audit.append(AuditRun(name, provider.__class__.__name__, "success", len(rows)))
+        if hasattr(provider, "fetch_security_statuses"):
+            rows = provider.fetch_security_statuses()
+            for row in rows:
+                self.security_statuses[(row.ts_code, row.effective_from)] = row
+            self.audit.append(AuditRun("security_statuses", provider.__class__.__name__, "success", len(rows)))
         if hasattr(provider, "fetch_valuations"):
             rows = provider.fetch_valuations()
             for row in rows:
@@ -178,7 +186,7 @@ class InMemoryStore:
         return len(rows)
 
     def counts(self) -> dict[str, int]:
-        return {"securities": len(self.securities), "prices": len(self.prices), "financials": len(self.financials), "industries": len(self.industries), "valuation_count": len(self.valuations), "benchmark_count": len(self.benchmarks)}
+        return {"securities": len(self.securities), "security_statuses": len(self.security_statuses), "prices": len(self.prices), "financials": len(self.financials), "industries": len(self.industries), "valuation_count": len(self.valuations), "benchmark_count": len(self.benchmarks)}
 
     def data_quality(self, universe: str = "hs300") -> dict:
         """Return actionable coverage gaps for a snapshot without mutating it."""
@@ -207,6 +215,27 @@ class InMemoryStore:
 
     def industry_for(self, code: str):
         return [i for (c, _), i in self.industries.items() if c == code]
+
+    def security_status_for(self, code: str, as_of_date):
+        records = [
+            record
+            for (record_code, _), record in self.security_statuses.items()
+            if record_code == code
+            and record.effective_from <= as_of_date
+            and (record.effective_to is None or as_of_date <= record.effective_to)
+        ]
+        if records:
+            return max(records, key=lambda record: record.effective_from)
+        security = self.securities.get(code)
+        if security is None:
+            return None
+        return SecurityStatusRecord(
+            code,
+            security.list_date,
+            None,
+            is_st=security.is_st,
+            status_name="ST" if security.is_st else "NORMAL",
+        )
 
     def sync_index_members(self, index_code: str, members: list[tuple[str, object]]) -> None:
         for ts_code, effective_date in members:
@@ -659,6 +688,12 @@ class PostgresStore:
                     conn.commit()
                     from .markets.cn import persist_cn_calendar_intersection
                     persist_cn_calendar_intersection(self, calendar_records)
+            if hasattr(provider, "fetch_security_statuses"):
+                for r in provider.fetch_security_statuses():
+                    conn.execute(
+                        "INSERT INTO security_statuses (ts_code,effective_from,effective_to,is_st,status_name) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (ts_code,effective_from) DO UPDATE SET effective_to=EXCLUDED.effective_to,is_st=EXCLUDED.is_st,status_name=EXCLUDED.status_name",
+                        (r.ts_code, r.effective_from, r.effective_to, r.is_st, r.status_name),
+                    )
             price_skip = set(skip_codes.get("prices", set())) | self._completed_sync_codes(conn, sync_key, "prices")
             financial_skip = set(skip_codes.get("financials", set())) | self._completed_sync_codes(conn, sync_key, "financials")
             valuation_skip = set(skip_codes.get("valuations", set())) | self._completed_sync_codes(conn, sync_key, "valuations")
@@ -727,6 +762,8 @@ class PostgresStore:
         with self._connect() as conn:
             for row in conn.execute("SELECT ts_code,name,list_date,is_st,market_id,currency FROM securities"):
                 record = Security(*row); store.securities[record.ts_code] = record
+            for row in conn.execute("SELECT ts_code,effective_from,effective_to,is_st,status_name FROM security_statuses"):
+                record = SecurityStatusRecord(*row); store.security_statuses[(record.ts_code, record.effective_from)] = record
             for row in conn.execute("SELECT ts_code,trade_date,close,adj_factor,suspended,limit_up,limit_down,volume,open,high,low FROM price_bars"):
                 record = PriceBar(*row); store.prices[(record.ts_code, record.trade_date)] = record
             for row in conn.execute("SELECT ts_code,report_period,ann_date,revenue,net_profit,roe,gross_margin,operating_cashflow,debt_ratio,roic,current_ratio,free_cashflow,deduct_net_profit,data_version FROM financials"):

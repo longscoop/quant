@@ -178,7 +178,8 @@ class CnTradabilityProvider(TradabilityProvider):
         security = self.store.securities.get(instrument)
         if security is None:
             return TradabilityStatus(False, "unknown_security")
-        if security.is_st:
+        status = self.store.security_status_for(instrument, day) if hasattr(self.store, "security_status_for") else None
+        if status.is_st if status is not None else security.is_st:
             return TradabilityStatus(False, "st")
         if (day - security.list_date).days < self.min_listing_days:
             return TradabilityStatus(False, "new_listing")

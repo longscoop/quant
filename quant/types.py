@@ -17,6 +17,15 @@ class Security:
 
 
 @dataclass(frozen=True)
+class SecurityStatusRecord:
+    ts_code: str
+    effective_from: date
+    effective_to: date | None = None
+    is_st: bool = False
+    status_name: str | None = None
+
+
+@dataclass(frozen=True)
 class RawRecord:
     """Source-preserving record used for replay, audits, and revised filings."""
     dataset: str

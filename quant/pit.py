@@ -29,7 +29,8 @@ class PITRepository:
             security = self.store.securities.get(code)
             if not security:
                 exclusions[code] = "unknown_security"; continue
-            if security.is_st:
+            status = self.store.security_status_for(code, as_of_date) if hasattr(self.store, "security_status_for") else None
+            if (status.is_st if status is not None else security.is_st):
                 exclusions[code] = "st"; continue
             if (as_of_date - security.list_date).days < self.min_listing_days:
                 exclusions[code] = "new_listing"; continue
