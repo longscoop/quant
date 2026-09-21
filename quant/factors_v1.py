@@ -1,4 +1,4 @@
-"""Versioned, interpretable six-factor research scores."""
+"""Versioned, interpretable canonical factor research scores."""
 
 from __future__ import annotations
 
@@ -175,8 +175,7 @@ def _metrics(memory, codes, as_of, benchmark_id):
             series = [bar.adjusted_close for bar in prices[-252:]]
             raw[code]["r_drawdown"] = _max_drawdown_loss(series)
         if valuation:
-            raw[code]["r_liquidity"] = valuation.turnover_rate
-        raw[code]["r_financial"] = 0.0 if current and any(value is not None and value < 0 for value in (current.net_profit, current.operating_cashflow)) else 1.0 if current else None
+            raw[code]["l_turnover"] = valuation.turnover_rate
     return raw
 
 
