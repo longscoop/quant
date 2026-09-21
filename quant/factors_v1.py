@@ -43,7 +43,7 @@ def _percentiles(values: dict[str, float], higher_is_better: bool = True) -> dic
 
 
 def _financial_history(memory, code, as_of, trading_days):
-    return [item for item in memory.financials_for(code) if item.data_version == PIT_DATA_VERSION and (next_trading_day(item.ann_date, trading_days) or date.max) <= as_of]
+    return [item for item in memory.financials_for(code) if item.data_version == PIT_DATA_VERSION and (next_trading_day(item.available_at or item.ann_date, trading_days) or date.max) <= as_of]
 
 
 def _latest(items):

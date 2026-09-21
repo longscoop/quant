@@ -50,13 +50,13 @@ class PITRepository:
             last = history[-1]
             if not hasattr(self.store, "tradability_fact") and (last.suspended or last.limit_up or last.limit_down):
                 exclusions[code] = "untradable"; continue
-            visible = [f for f in self.store.financials_for(code) if f.ann_date <= as_of_date]
+            visible = [f for f in self.store.financials_for(code) if (f.available_at or f.ann_date) <= as_of_date]
             if not visible:
                 exclusions[code] = "missing_visible_financial"; continue
             by_period = defaultdict(list)
             for record in visible: by_period[record.report_period].append(record)
             latest_period = max(by_period)
-            latest = max(by_period[latest_period], key=lambda f: f.ann_date)
+            latest = max(by_period[latest_period], key=lambda f: (f.available_at or f.ann_date, f.ann_date, f.source_version or ""))
             industry_versions = [i for i in self.store.industry_for(code) if i.effective_date <= as_of_date and (i.effective_to is None or as_of_date <= i.effective_to)]
             included.append(security); financials.append(latest); prices[code] = history
             industries[code] = max(industry_versions, key=lambda i: i.effective_date).industry if industry_versions else "UNKNOWN"

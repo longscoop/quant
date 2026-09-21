@@ -404,7 +404,29 @@ class TushareProvider(DataProvider):
                     report, announced = getattr(r, "end_date"), getattr(r, "ann_date")
                     income_row, cashflow_row = income.get((report, announced)), cashflows.get((report, announced))
                     percent = lambda value: None if value is None else value / 100
-                    result.append(FinancialRecord(r.ts_code, date.fromisoformat(f"{report[:4]}-{report[4:6]}-{report[6:]}"), date.fromisoformat(f"{announced[:4]}-{announced[4:6]}-{announced[6:]}"), parse(getattr(income_row, "total_revenue", getattr(r, "total_revenue", None))), parse(getattr(income_row, "n_income_attr_p", getattr(r, "n_income", None))), percent(parse(getattr(r, "roe", None))), percent(parse(getattr(r, "grossprofit_margin", None))), parse(getattr(cashflow_row, "n_cashflow_act", None)), percent(parse(getattr(r, "debt_to_assets", None))), roic=percent(parse(getattr(r, "roic", None))), current_ratio=parse(getattr(r, "current_ratio", None)), free_cashflow=parse(getattr(cashflow_row, "free_cashflow", None)), deduct_net_profit=parse(getattr(r, "profit_dedt", None)), data_version="pit_v1.0"))
+                    ann_date = date.fromisoformat(f"{announced[:4]}-{announced[4:6]}-{announced[6:]}")
+                    first_ann = self._parse_source_date(getattr(r, "f_ann_date", None)) or ann_date
+                    result.append(
+                        FinancialRecord(
+                            r.ts_code,
+                            date.fromisoformat(f"{report[:4]}-{report[4:6]}-{report[6:]}"),
+                            ann_date,
+                            parse(getattr(income_row, "total_revenue", getattr(r, "total_revenue", None))),
+                            parse(getattr(income_row, "n_income_attr_p", getattr(r, "n_income", None))),
+                            percent(parse(getattr(r, "roe", None))),
+                            percent(parse(getattr(r, "grossprofit_margin", None))),
+                            parse(getattr(cashflow_row, "n_cashflow_act", None)),
+                            percent(parse(getattr(r, "debt_to_assets", None))),
+                            roic=percent(parse(getattr(r, "roic", None))),
+                            current_ratio=parse(getattr(r, "current_ratio", None)),
+                            free_cashflow=parse(getattr(cashflow_row, "free_cashflow", None)),
+                            deduct_net_profit=parse(getattr(r, "profit_dedt", None)),
+                            data_version="pit_v1.0",
+                            first_ann_date=first_ann,
+                            available_at=ann_date,
+                            source_version=str(getattr(r, "update_flag", "")) or None,
+                        )
+                    )
             except Exception as exc:
                 self._record_error("financial", code, exc)
                 self._progress("财务报表", index, len(codes), f"{code}：失败（{exc}）")

@@ -88,6 +88,9 @@ class FinancialRecord:
     free_cashflow: float | None = None
     deduct_net_profit: float | None = None
     data_version: str = "legacy-v0"
+    first_ann_date: date | None = None
+    available_at: date | None = None
+    source_version: str | None = None
 
 
 @dataclass(frozen=True)

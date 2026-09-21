@@ -94,7 +94,7 @@ POSTGRES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS securities (ts_code text PRIMARY KEY, name text NOT NULL, list_date date NOT NULL, is_st boolean NOT NULL DEFAULT false);
 CREATE TABLE IF NOT EXISTS security_statuses (ts_code text NOT NULL, effective_from date NOT NULL, effective_to date, is_st boolean NOT NULL DEFAULT false, status_name text, PRIMARY KEY (ts_code, effective_from));
 CREATE TABLE IF NOT EXISTS price_bars (ts_code text NOT NULL, trade_date date NOT NULL, close double precision NOT NULL, adj_factor double precision NOT NULL, suspended boolean NOT NULL, limit_up boolean NOT NULL, limit_down boolean NOT NULL, volume double precision NOT NULL, open double precision, high double precision, low double precision, PRIMARY KEY (ts_code, trade_date));
-CREATE TABLE IF NOT EXISTS financials (ts_code text NOT NULL, report_period date NOT NULL, ann_date date NOT NULL, revenue double precision NOT NULL, net_profit double precision NOT NULL, roe double precision NOT NULL, gross_margin double precision NOT NULL, operating_cashflow double precision NOT NULL, debt_ratio double precision NOT NULL, PRIMARY KEY (ts_code, report_period, ann_date));
+CREATE TABLE IF NOT EXISTS financials (ts_code text NOT NULL, report_period date NOT NULL, ann_date date NOT NULL, revenue double precision NOT NULL, net_profit double precision NOT NULL, roe double precision NOT NULL, gross_margin double precision NOT NULL, operating_cashflow double precision NOT NULL, debt_ratio double precision NOT NULL, first_ann_date date, available_at date, source_version text, PRIMARY KEY (ts_code, report_period, ann_date));
 CREATE TABLE IF NOT EXISTS industries (ts_code text NOT NULL, industry text NOT NULL, effective_date date NOT NULL, effective_to date, PRIMARY KEY (ts_code, effective_date));
 CREATE TABLE IF NOT EXISTS ingestion_audit (dataset text NOT NULL, source text NOT NULL, status text NOT NULL, row_count integer NOT NULL, created_at timestamptz NOT NULL, error text);
 CREATE TABLE IF NOT EXISTS index_members (index_code text NOT NULL, ts_code text NOT NULL, effective_date date NOT NULL, PRIMARY KEY (index_code, ts_code, effective_date));
@@ -625,7 +625,16 @@ class PostgresStore:
             conn.execute(POSTGRES_SCHEMA)
             for column in ("revenue", "net_profit", "roe", "gross_margin", "operating_cashflow", "debt_ratio"):
                 conn.execute(f"ALTER TABLE financials ALTER COLUMN {column} DROP NOT NULL")
-            for column in ("roic double precision", "current_ratio double precision", "free_cashflow double precision", "deduct_net_profit double precision", "data_version text NOT NULL DEFAULT 'legacy-v0'"):
+            for column in (
+                "roic double precision",
+                "current_ratio double precision",
+                "free_cashflow double precision",
+                "deduct_net_profit double precision",
+                "data_version text NOT NULL DEFAULT 'legacy-v0'",
+                "first_ann_date date",
+                "available_at date",
+                "source_version text",
+            ):
                 conn.execute(f"ALTER TABLE financials ADD COLUMN IF NOT EXISTS {column}")
             for column in ("pe", "pb", "ps", "dividend_yield"):
                 conn.execute(f"ALTER TABLE financials DROP COLUMN IF EXISTS {column}")
@@ -804,18 +813,18 @@ class PostgresStore:
                 for r in provider.fetch_prices():
                     conn.execute(price_sql, (r.ts_code, r.trade_date, r.close, r.adj_factor, r.suspended, r.limit_up, r.limit_down, r.volume, r.open, r.high, r.low))
                 conn.commit()
-            financial_sql = "INSERT INTO financials (ts_code,report_period,ann_date,revenue,net_profit,roe,gross_margin,operating_cashflow,debt_ratio,roic,current_ratio,free_cashflow,deduct_net_profit,data_version) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ts_code,report_period,ann_date) DO UPDATE SET revenue=EXCLUDED.revenue, net_profit=EXCLUDED.net_profit, roe=EXCLUDED.roe, gross_margin=EXCLUDED.gross_margin, operating_cashflow=EXCLUDED.operating_cashflow, debt_ratio=EXCLUDED.debt_ratio, roic=EXCLUDED.roic, current_ratio=EXCLUDED.current_ratio, free_cashflow=EXCLUDED.free_cashflow, deduct_net_profit=EXCLUDED.deduct_net_profit, data_version=EXCLUDED.data_version"
+            financial_sql = "INSERT INTO financials (ts_code,report_period,ann_date,revenue,net_profit,roe,gross_margin,operating_cashflow,debt_ratio,roic,current_ratio,free_cashflow,deduct_net_profit,data_version,first_ann_date,available_at,source_version) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ts_code,report_period,ann_date) DO UPDATE SET revenue=EXCLUDED.revenue, net_profit=EXCLUDED.net_profit, roe=EXCLUDED.roe, gross_margin=EXCLUDED.gross_margin, operating_cashflow=EXCLUDED.operating_cashflow, debt_ratio=EXCLUDED.debt_ratio, roic=EXCLUDED.roic, current_ratio=EXCLUDED.current_ratio, free_cashflow=EXCLUDED.free_cashflow, deduct_net_profit=EXCLUDED.deduct_net_profit, data_version=EXCLUDED.data_version, first_ann_date=EXCLUDED.first_ann_date, available_at=EXCLUDED.available_at, source_version=EXCLUDED.source_version"
             if hasattr(provider, "iter_financial_batches"):
                 for code, batch in provider.iter_financial_batches(skip_codes=financial_skip):
                     for r in batch:
-                        conn.execute(financial_sql, (r.ts_code, r.report_period, r.ann_date, r.revenue, r.net_profit, r.roe, r.gross_margin, r.operating_cashflow, r.debt_ratio, r.roic, r.current_ratio, r.free_cashflow, r.deduct_net_profit, r.data_version))
+                        conn.execute(financial_sql, (r.ts_code, r.report_period, r.ann_date, r.revenue, r.net_profit, r.roe, r.gross_margin, r.operating_cashflow, r.debt_ratio, r.roic, r.current_ratio, r.free_cashflow, r.deduct_net_profit, r.data_version, r.first_ann_date, r.available_at, r.source_version))
                     if hasattr(provider, "raw_financial_records_for"):
                         self._persist_raw_records(conn, provider.raw_financial_records_for(code))
                     self._record_sync_checkpoint(conn, sync_key, "financials", code)
                     conn.commit()
             else:
                 for r in provider.fetch_financials():
-                    conn.execute(financial_sql, (r.ts_code, r.report_period, r.ann_date, r.revenue, r.net_profit, r.roe, r.gross_margin, r.operating_cashflow, r.debt_ratio, r.roic, r.current_ratio, r.free_cashflow, r.deduct_net_profit, r.data_version))
+                    conn.execute(financial_sql, (r.ts_code, r.report_period, r.ann_date, r.revenue, r.net_profit, r.roe, r.gross_margin, r.operating_cashflow, r.debt_ratio, r.roic, r.current_ratio, r.free_cashflow, r.deduct_net_profit, r.data_version, r.first_ann_date, r.available_at, r.source_version))
                 conn.commit()
             for r in provider.fetch_industries(): conn.execute("INSERT INTO industries (ts_code,industry,effective_date,effective_to) VALUES (%s,%s,%s,%s) ON CONFLICT (ts_code,effective_date) DO UPDATE SET industry=EXCLUDED.industry,effective_to=EXCLUDED.effective_to", (r.ts_code,r.industry,r.effective_date,r.effective_to))
             valuation_sql = "INSERT INTO valuation_bars VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ts_code,trade_date) DO UPDATE SET pe_ttm=EXCLUDED.pe_ttm,pb=EXCLUDED.pb,ps_ttm=EXCLUDED.ps_ttm,dividend_yield=EXCLUDED.dividend_yield,turnover_rate=EXCLUDED.turnover_rate,data_version=EXCLUDED.data_version"
@@ -856,7 +865,7 @@ class PostgresStore:
                 record = SecurityStatusRecord(*row); store.security_statuses[(record.ts_code, record.effective_from)] = record
             for row in conn.execute("SELECT ts_code,trade_date,close,adj_factor,suspended,limit_up,limit_down,volume,open,high,low FROM price_bars"):
                 record = PriceBar(*row); store.prices[(record.ts_code, record.trade_date)] = record
-            for row in conn.execute("SELECT ts_code,report_period,ann_date,revenue,net_profit,roe,gross_margin,operating_cashflow,debt_ratio,roic,current_ratio,free_cashflow,deduct_net_profit,data_version FROM financials"):
+            for row in conn.execute("SELECT ts_code,report_period,ann_date,revenue,net_profit,roe,gross_margin,operating_cashflow,debt_ratio,roic,current_ratio,free_cashflow,deduct_net_profit,data_version,first_ann_date,available_at,source_version FROM financials"):
                 record = FinancialRecord(*row); store.financials[(record.ts_code, record.report_period, record.ann_date)] = record
             for row in conn.execute("SELECT ts_code,industry,effective_date,effective_to FROM industries"):
                 record = IndustryRecord(*row); store.industries[(record.ts_code, record.effective_date)] = record
