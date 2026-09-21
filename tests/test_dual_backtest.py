@@ -70,6 +70,73 @@ class QuantityBacktestTest(unittest.TestCase):
         self.assertEqual(result.holdings, {"000001.SZ": 1000.0})
         self.assertAlmostEqual(result.metrics["turnover"], 10_000 / 10_050)
 
+    def test_execution_contract_digest_is_stable_and_cost_sensitive(self):
+        from quant.execution import execution_contract_digest
+
+        base = [{
+            "signal_date": date(2024, 1, 2),
+            "execution_date": date(2024, 1, 3),
+            "instrument": "000001.SZ",
+            "side": "BUY",
+            "target_weight": 1.0,
+            "target_quantity": 1000.0,
+            "executed_quantity": 1000.0,
+            "reason": None,
+            "cost_audit": {"buy_commission_bps": 2.0, "slippage_bps": 1.0},
+        }]
+        same = [dict(base[0])]
+        changed = [{**base[0], "cost_audit": {"buy_commission_bps": 3.0, "slippage_bps": 1.0}}]
+
+        self.assertEqual(execution_contract_digest(base), execution_contract_digest(same))
+        self.assertNotEqual(execution_contract_digest(base), execution_contract_digest(changed))
+
+    def test_qlib_shared_orders_use_project_cost_contract(self):
+        calls = {}
+        shared = [{
+            "signal_date": date(2024, 1, 2),
+            "execution_date": date(2024, 1, 3),
+            "instrument": "000001.SZ",
+            "side": "SELL",
+            "target_quantity": 0.0,
+            "executed_quantity": 1000.0,
+            "reason": None,
+            "cost_audit": {
+                "buy_commission_bps": 2.0,
+                "sell_commission_bps": 2.0,
+                "sell_tax_bps": 5.0,
+                "minimum_commission": 5.0,
+                "slippage_bps": 1.0,
+            },
+        }]
+
+        class Strategy:
+            generated_orders = []
+
+        def backtest_func(**kwargs):
+            calls.update(kwargs)
+            import pandas as pd
+            report = pd.DataFrame(
+                {"return": [0.0], "bench": [0.0], "cost": [0.0], "turnover": [0.0]},
+                index=pd.to_datetime(["2024-01-03"]),
+            )
+            return report, {"cash": 10_000.0, "holdings": {}}
+
+        context = ResearchContext("CN", "CNY", "CN_A_SHARE", "000300.SH", "000300.SH")
+        run_qlib_quantity_backtest(
+            prediction=None,
+            config=QuantityBacktestConfig(context, 1, 10_000.0, date(2024, 1, 2), date(2024, 1, 3)),
+            mapper=__import__("quant.markets.cn", fromlist=["CnInstrumentMapper"]).CnInstrumentMapper(),
+            cost_bps=10.0,
+            trade_unit=100,
+            backtest_func=backtest_func,
+            strategy_factory=lambda **_: Strategy(),
+            shared_order_records=shared,
+        )
+
+        self.assertAlmostEqual(calls["exchange_kwargs"]["open_cost"], .0003)
+        self.assertAlmostEqual(calls["exchange_kwargs"]["close_cost"], .0008)
+        self.assertAlmostEqual(calls["exchange_kwargs"]["min_cost"], 5.0)
+
     def test_comparator_distinguishes_explained_and_unexplained_differences(self):
         base = BacktestEngineResult(
             engine="project",
