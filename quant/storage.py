@@ -1147,9 +1147,19 @@ class PostgresStore:
     def get_run(self, run_id: str) -> dict:
         with self._connect() as conn:
             row = conn.execute("SELECT run_id::text,run_type,status,parameters,payload,error,created_at,completed_at FROM research_runs WHERE run_id=%s", (run_id,)).fetchone()
-        if not row:
-            raise KeyError(f"Unknown research run: {run_id}")
-        return {"run_id": row[0], "run_type": row[1], "status": row[2], "parameters": row[3], "payload": row[4], "error": row[5], "created_at": row[6], "completed_at": row[7]}
+            if not row:
+                raise KeyError(f"Unknown research run: {run_id}")
+            payload = dict(row[4] or {})
+            row_storage = payload.get("row_storage") or {}
+            if row[1] == "factors" and row_storage.get("kind") == "factor_run_items":
+                payload["rows"] = [
+                    {"as_of_date": item[0], "ts_code": item[1], "values": item[2]}
+                    for item in conn.execute(
+                        "SELECT as_of_date,ts_code,values FROM factor_run_items WHERE run_id=%s ORDER BY as_of_date,ts_code",
+                        (run_id,),
+                    )
+                ]
+        return {"run_id": row[0], "run_type": row[1], "status": row[2], "parameters": row[3], "payload": payload, "error": row[5], "created_at": row[6], "completed_at": row[7]}
 
     def status(self) -> dict:
         store = self.load_memory()
