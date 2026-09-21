@@ -127,6 +127,53 @@ class MarketFoundationTest(unittest.TestCase):
         )
 
 
+class WalkForwardValidationTest(unittest.TestCase):
+    def test_walk_forward_splits_advance_test_window_without_overlap(self):
+        from quant.walk_forward import generate_walk_forward_splits
+
+        sessions = [date(2024, 1, 1) + timedelta(days=i) for i in range(100)]
+        calendar = StaticMarketCalendar("TEST_CAL", sessions)
+        splits = generate_walk_forward_splits(
+            calendar,
+            sessions[0],
+            sessions[-1],
+            train_sessions=40,
+            valid_sessions=20,
+            test_sessions=10,
+            step_sessions=10,
+            label_horizon=20,
+        )
+
+        self.assertEqual(splits[0].train, DateSegment(sessions[0], sessions[39]))
+        self.assertEqual(splits[0].valid, DateSegment(sessions[40], sessions[59]))
+        self.assertEqual(splits[0].test, DateSegment(sessions[60], sessions[69]))
+        self.assertEqual(splits[1].test, DateSegment(sessions[70], sessions[79]))
+        self.assertLess(splits[0].test.end, splits[1].test.start)
+
+    def test_oos_summary_reports_predictive_and_portfolio_stability(self):
+        from quant.walk_forward import summarize_oos
+
+        rows = []
+        for day_offset in range(3):
+            day = date(2024, 1, 2) + timedelta(days=day_offset)
+            for i in range(1, 11):
+                rows.append({
+                    "date": day,
+                    "instrument": f"S{i}",
+                    "score": float(i),
+                    "label": i / 100.0,
+                })
+
+        report = summarize_oos(pd.DataFrame(rows), top_fraction=.2)
+
+        self.assertAlmostEqual(report["ic"]["mean"], 1.0)
+        self.assertAlmostEqual(report["rank_ic"]["mean"], 1.0)
+        self.assertGreater(report["top_bottom_spread"]["mean"], 0)
+        self.assertEqual(report["hit_rate"], 1.0)
+        self.assertEqual(report["turnover"]["mean"], 0.0)
+        self.assertLessEqual(report["max_drawdown"], 0.0)
+
+
 class QlibDatasetAdapterTest(unittest.TestCase):
     def setUp(self):
         self.sessions = [date(2024, 1, 2) + timedelta(days=offset) for offset in range(120)]
