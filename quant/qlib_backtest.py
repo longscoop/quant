@@ -16,6 +16,7 @@ from .markets import (
     TransactionCostModel,
     UniverseProvider,
 )
+from .execution import execute_target_weights
 from .types import MarketPredictionRow
 
 
@@ -158,69 +159,22 @@ def run_project_quantity_backtest(
                     reverse=True,
                 )[: config.top_n]
                 targets = {row.canonical_instrument_id: 1.0 / len(ranked) for row in ranked} if ranked else {}
-                target_quantities: dict[str, float] = {}
-                for code, weight in targets.items():
-                    bar = memory.prices.get((code, day))
-                    if bar is None or bar.adjusted_open is None:
-                        target_quantities[code] = 0.0
-                        continue
-                    lot = lot_size_provider.lot_size(code, day)
-                    target_quantities[code] = floor((signal_value * weight / float(bar.adjusted_open)) / lot) * lot
-                for code in sorted(set(holdings) | set(target_quantities), key=lambda value: (0 if target_quantities.get(value, 0.0) < holdings.get(value, 0.0) else 1, value)):
-                    current = holdings.get(code, 0.0)
-                    target = target_quantities.get(code, 0.0)
-                    side = "SELL" if target < current else "BUY"
-                    requested = abs(target - current)
-                    if requested <= 0:
-                        continue
-                    status = tradability_provider.status(code, day, side)
-                    bar = memory.prices.get((code, day))
-                    base_record = {
-                        "signal_date": signal_day,
-                        "execution_date": day,
-                        "instrument": code,
-                        "side": side,
-                        "target_weight": targets.get(code, 0.0),
-                        "target_quantity": target,
-                    }
-                    if not status.tradable or bar is None or bar.adjusted_open is None:
-                        records.append({**base_record, "executed_quantity": 0.0, "actual_weight": current * (float(bar.adjusted_open) if bar and bar.adjusted_open else 0.0) / signal_value, "reason": status.reason or "missing_open"})
-                        continue
-                    price = float(bar.adjusted_open)
-                    quantity = requested
-                    if side == "BUY":
-                        lot = lot_size_provider.lot_size(code, day)
-                        per_lot = lot * price
-                        affordable_lots = floor(cash / per_lot)
-                        quantity = min(quantity, affordable_lots * lot)
-                    order = Order(code, side, quantity, price, day)
-                    cost = cost_model.calculate(order, PortfolioState(cash, dict(holdings)))
-                    gross = quantity * price
-                    if side == "BUY" and gross + cost.amount > cash:
-                        lot = lot_size_provider.lot_size(code, day)
-                        quantity = max(0.0, quantity - lot)
-                        order = Order(code, side, quantity, price, day)
-                        cost = cost_model.calculate(order, PortfolioState(cash, dict(holdings)))
-                        gross = quantity * price
-                    if quantity <= 0:
-                        records.append({**base_record, "executed_quantity": 0.0, "actual_weight": current * price / signal_value, "reason": "insufficient_cash_or_position"})
-                        continue
-                    cash += gross - cost.amount if side == "SELL" else -gross - cost.amount
-                    new_quantity = current - quantity if side == "SELL" else current + quantity
-                    if new_quantity > 0:
-                        holdings[code] = new_quantity
-                    else:
-                        holdings.pop(code, None)
-                    gross_traded += gross
-                    records.append({
-                        **base_record,
-                        "executed_quantity": quantity,
-                        "actual_weight": new_quantity * price / signal_value,
-                        "reason": None,
-                        "gross_amount": gross,
-                        "fee_amount": cost.amount,
-                        "cost_audit": cost.audit,
-                    })
+                batch = execute_target_weights(
+                    memory=memory,
+                    signal_date=signal_day,
+                    execution_date=day,
+                    signal_value=signal_value,
+                    target_weights=targets,
+                    holdings=holdings,
+                    cash=cash,
+                    tradability_provider=tradability_provider,
+                    cost_model=cost_model,
+                    lot_size_provider=lot_size_provider,
+                )
+                cash = batch.cash
+                holdings = dict(batch.holdings)
+                gross_traded += batch.gross_traded
+                records.extend(batch.records)
         value = portfolio_value(day)
         if value is not None:
             equity_curve.append((day, value / config.initial_capital))
