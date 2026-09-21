@@ -16,7 +16,7 @@ def attach_forward_excess_return_labels(
     calendar: MarketCalendar,
     horizon: int = 20,
 ) -> pd.DataFrame:
-    """Attach strict T→T+20 excess returns to an already PIT-safe feature frame."""
+    """Attach executable T+1 open → T+20 close excess returns to a PIT-safe feature frame."""
     if horizon != 20:
         raise ValueError("v1 only supports a 20-session label horizon")
     if calendar.calendar_id != context.calendar_id:
@@ -32,40 +32,48 @@ def attach_forward_excess_return_labels(
     if currencies and currencies != {context.currency}:
         raise ValueError("label source currency does not match ResearchContext")
 
-    benchmark = {bar.trade_date: float(bar.close) for bar in memory.benchmark_for(context.benchmark_id)}
+    benchmark = {bar.trade_date: bar for bar in memory.benchmark_for(context.benchmark_id)}
     price_maps: dict[str, dict[date, object]] = {}
     result = features.copy()
     labels: list[float | None] = []
+    label_start_dates: list[date | None] = []
     label_end_dates: list[date | None] = []
     for row in result.itertuples(index=False):
         feature_day = row.feature_date
         if isinstance(feature_day, pd.Timestamp):
             feature_day = feature_day.date()
         try:
+            entry_day = calendar.shift(feature_day, 1)
             label_day = calendar.shift(feature_day, horizon)
         except ValueError:
             labels.append(None)
+            label_start_dates.append(None)
             label_end_dates.append(None)
             continue
         code = row.canonical_instrument_id
         price_map = price_maps.setdefault(code, {bar.trade_date: bar for bar in memory.prices_for(code)})
-        start_bar, end_bar = price_map.get(feature_day), price_map.get(label_day)
-        start_benchmark, end_benchmark = benchmark.get(feature_day), benchmark.get(label_day)
+        entry_bar, end_bar = price_map.get(entry_day), price_map.get(label_day)
+        entry_benchmark, end_benchmark = benchmark.get(entry_day), benchmark.get(label_day)
         endpoints = (
-            getattr(start_bar, "adjusted_close", None),
+            getattr(entry_bar, "adjusted_open", None),
             getattr(end_bar, "adjusted_close", None),
-            start_benchmark,
-            end_benchmark,
+            getattr(entry_benchmark, "open", None),
+            getattr(end_benchmark, "close", None),
         )
         if any(value is None or not isfinite(float(value)) or float(value) <= 0 for value in endpoints):
             labels.append(None)
+            label_start_dates.append(None)
             label_end_dates.append(None)
             continue
         stock_return = float(endpoints[1]) / float(endpoints[0]) - 1
         benchmark_return = float(endpoints[3]) / float(endpoints[2]) - 1
         labels.append(stock_return - benchmark_return)
+        label_start_dates.append(entry_day)
         label_end_dates.append(label_day)
     result["label"] = labels
+    result["label_start_date"] = label_start_dates
     result["label_end_date"] = label_end_dates
+    result.attrs["label_definition"] = "T+1_OPEN_TO_T+20_CLOSE_EXCESS"
+    result.attrs["label_horizon"] = horizon
     return result
 
