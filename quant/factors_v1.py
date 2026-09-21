@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date
 from math import isfinite, sqrt
-from statistics import mean, pstdev
+from statistics import mean, median, pstdev
 
 from .pit_v1 import next_trading_day
 from .scoring import FACTOR_MODEL_VERSION, PIT_DATA_VERSION, blended_percentile, composite_score, factor_score
@@ -82,6 +82,52 @@ def _returns(prices, benchmark, window):
     return end / start - end_b / start_b
 
 
+def _industry_metrics(raw: dict[str, dict], industries: dict[str, str], *, min_members: int = 3) -> dict[str, dict]:
+    """Build industry-level metrics and assign the same values to each member."""
+    members_by_industry = defaultdict(list)
+    for code in raw:
+        members_by_industry[industries.get(code, "UNKNOWN")].append(code)
+
+    by_code = {code: {} for code in raw}
+    for industry, members in members_by_industry.items():
+        if industry == "UNKNOWN" or len(members) < min_members:
+            continue
+
+        momentum_values = []
+        growth_values = []
+        breadth_values = []
+        valuation_values = []
+        for code in members:
+            values = raw[code]
+            momentum_parts = [float(values[name]) for name in ("m_20", "m_60", "m_120") if _finite(values.get(name))]
+            if momentum_parts:
+                momentum_values.append(mean(momentum_parts))
+
+            growth_parts = [float(values[name]) for name in ("g_profit_yoy", "g_revenue_yoy") if _finite(values.get(name))]
+            if growth_parts:
+                growth_values.append(mean(growth_parts))
+
+            if _finite(values.get("m_60")):
+                breadth_values.append(float(values["m_60"]) > 0)
+
+            if _finite(values.get("v_pe")) and float(values["v_pe"]) > 0:
+                valuation_values.append(float(values["v_pe"]))
+
+        metrics = {}
+        if len(momentum_values) >= min_members:
+            metrics["i_momentum"] = mean(momentum_values)
+        if len(growth_values) >= min_members:
+            metrics["i_growth"] = median(growth_values)
+        if len(breadth_values) >= min_members:
+            metrics["i_breadth"] = sum(breadth_values) / len(breadth_values)
+        if len(valuation_values) >= min_members:
+            metrics["i_valuation"] = median(valuation_values)
+
+        for code in members:
+            by_code[code] = dict(metrics)
+    return by_code
+
+
 def _metrics(memory, codes, as_of, benchmark_id):
     trading_days = sorted({bar.trade_date for bar in memory.prices.values()})
     benchmark = [bar for bar in memory.benchmark_for(benchmark_id) if bar.trade_date <= as_of]
@@ -143,20 +189,56 @@ def build_rankings(memory, as_of: date, template_id: str = "quality_growth", *, 
     benchmark_id = context.benchmark_id if context is not None else "000300.SH"
     raw = _metrics(memory, codes, as_of, benchmark_id)
     industries = dict(snapshot.industries)
-    directions = {"q_debt": False, "q_accrual": False, "v_pe": False, "v_pb": False, "v_ps": False, "v_peg": False, "r_volatility": False, "r_drawdown": False}
+    industry_values = _industry_metrics(raw, industries)
+    for code in codes:
+        raw[code].update(industry_values.get(code, {}))
+
+    directions = {
+        "q_debt": False,
+        "q_accrual": False,
+        "v_pe": False,
+        "v_pb": False,
+        "v_ps": False,
+        "v_peg": False,
+        "r_volatility": False,
+        "r_drawdown": False,
+        "i_valuation": False,
+    }
     percentiles = {code: {} for code in codes}
     for metric in {key for values in raw.values() for key in values}:
+        if metric.startswith("i_"):
+            industry_raw = {}
+            for code in codes:
+                industry = industries.get(code, "UNKNOWN")
+                value = raw[code].get(metric)
+                if industry != "UNKNOWN" and _finite(value):
+                    industry_raw.setdefault(industry, value)
+            industry_percentiles = _percentiles(industry_raw, directions.get(metric, True))
+            for code in codes:
+                industry = industries.get(code, "UNKNOWN")
+                if industry in industry_percentiles:
+                    percentiles[code][metric] = industry_percentiles[industry]
+            continue
+
         universe = _percentiles({code: raw[code].get(metric) for code in codes}, directions.get(metric, True))
         group = defaultdict(list)
-        for code in universe: group[industries[code]].append(code)
+        for code in universe:
+            group[industries.get(code, "UNKNOWN")].append(code)
         for code in codes:
-            if code not in universe: continue
+            if code not in universe:
+                continue
             factor = metric[0]
-            group_values = {peer: raw[peer].get(metric) for peer in group[industries[code]]}
-            industry = _percentiles(group_values, directions.get(metric, True)) if len(group_values) >= 5 else {}
+            industry_name = industries.get(code, "UNKNOWN")
+            group_values = {peer: raw[peer].get(metric) for peer in group[industry_name]}
+            industry = _percentiles(group_values, directions.get(metric, True)) if industry_name != "UNKNOWN" and len(group_values) >= 5 else {}
             if factor in {"q", "g", "v"}:
                 weights = INDUSTRY_BLEND[{"q": "quality", "g": "growth", "v": "valuation"}[factor]]
-                percentiles[code][metric] = blended_percentile(universe.get(code), industry.get(code), industry_weight=weights[0], universe_weight=weights[1])
+                percentiles[code][metric] = blended_percentile(
+                    universe.get(code),
+                    industry.get(code),
+                    industry_weight=weights[0],
+                    universe_weight=weights[1],
+                )
             else:
                 percentiles[code][metric] = universe.get(code)
     result = []
