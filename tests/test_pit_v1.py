@@ -90,6 +90,43 @@ class PitV1ScoringTests(unittest.TestCase):
         self.assertIsNone(blended_percentile(0.8, None, industry_weight=.7, universe_weight=.3))
         self.assertAlmostEqual(blended_percentile(0.8, 0.5, industry_weight=.7, universe_weight=.3), .59)
 
+    def test_financial_revision_is_visible_only_after_its_own_announcement(self):
+        from quant.pit import PITRepository
+        from quant.storage import InMemoryStore
+        from quant.types import FinancialRecord, PriceBar, Security
+
+        store = InMemoryStore()
+        code = "000001.SZ"
+        store.securities[code] = Security(code, "Alpha", date(2010, 1, 1))
+        for day in (date(2024, 4, 22), date(2024, 4, 29)):
+            store.prices[(code, day)] = PriceBar(code, day, 10.0)
+        original = FinancialRecord(
+            code, date(2023, 12, 31), date(2024, 4, 20),
+            1000.0, 100.0, .10, .30, 120.0, .40,
+            data_version="pit_v1.0",
+            first_ann_date=date(2024, 4, 20),
+            available_at=date(2024, 4, 20),
+            source_version="0",
+        )
+        revised = FinancialRecord(
+            code, date(2023, 12, 31), date(2024, 4, 26),
+            1000.0, 120.0, .12, .30, 130.0, .40,
+            data_version="pit_v1.0",
+            first_ann_date=date(2024, 4, 20),
+            available_at=date(2024, 4, 26),
+            source_version="1",
+        )
+        store.financials[(code, original.report_period, original.ann_date)] = original
+        store.financials[(code, revised.report_period, revised.ann_date)] = revised
+
+        before_revision = PITRepository(store).snapshot(date(2024, 4, 22))
+        after_revision = PITRepository(store).snapshot(date(2024, 4, 29))
+
+        self.assertEqual(before_revision.financials[0].net_profit, 100.0)
+        self.assertEqual(after_revision.financials[0].net_profit, 120.0)
+        self.assertEqual(after_revision.financials[0].first_ann_date, date(2024, 4, 20))
+        self.assertEqual(after_revision.financials[0].source_version, "1")
+
     def test_financial_announcement_is_only_tradable_next_session(self):
         from quant.pit_v1 import next_trading_day
 
