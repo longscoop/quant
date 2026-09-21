@@ -3,6 +3,17 @@ from datetime import date
 
 
 class PitV1ScoringTests(unittest.TestCase):
+    def test_drawdown_risk_scores_smaller_losses_higher(self):
+        from quant.factors_v1 import _max_drawdown_loss, _percentiles
+
+        mild = _max_drawdown_loss([100.0, 90.0, 95.0])
+        severe = _max_drawdown_loss([100.0, 50.0, 80.0])
+        scores = _percentiles({"mild": mild, "severe": severe}, higher_is_better=False)
+
+        self.assertAlmostEqual(mild, 0.10)
+        self.assertAlmostEqual(severe, 0.50)
+        self.assertGreater(scores["mild"], scores["severe"])
+
     def test_factor_below_half_coverage_is_unavailable(self):
         from quant.scoring import factor_score
 
