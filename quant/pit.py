@@ -7,6 +7,41 @@ from .types import PITSnapshot
 from .markets import ResearchContext, UniverseProvider
 
 
+def universe_snapshot_quality(store, index_code: str, as_of_date: date) -> dict:
+    """Describe the exact historical index snapshot used at an as-of date."""
+    entries = [
+        (code, effective_date)
+        for index, code, effective_date in getattr(store, "index_members", {})
+        if index == index_code and effective_date <= as_of_date
+    ]
+    snapshot_dates = [effective_date for _, effective_date in entries]
+    if not snapshot_dates:
+        return {
+            "index_code": index_code,
+            "as_of_date": as_of_date,
+            "snapshot_date": None,
+            "snapshot_age_days": None,
+            "member_count": 0,
+            "missing_security_codes": [],
+            "status": "invalid",
+            "reason": "missing_historical_snapshot",
+        }
+
+    snapshot_date = max(snapshot_dates)
+    members = sorted({code for code, effective_date in entries if effective_date == snapshot_date})
+    missing = sorted(code for code in members if code not in getattr(store, "securities", {}))
+    return {
+        "index_code": index_code,
+        "as_of_date": as_of_date,
+        "snapshot_date": snapshot_date,
+        "snapshot_age_days": (as_of_date - snapshot_date).days,
+        "member_count": len(members),
+        "missing_security_codes": missing,
+        "status": "degraded" if missing else "valid",
+        "reason": "missing_security_master" if missing else None,
+    }
+
+
 class PITRepository:
     def __init__(self, store: InMemoryStore, min_listing_days: int = 180, *, context: ResearchContext | None = None, universe_provider: UniverseProvider | None = None):
         self.store = store
@@ -57,4 +92,10 @@ class PITRepository:
         metadata = {"pit_safe": True, "data_version": len(self.store.audit)}
         if self.context is not None:
             metadata["context"] = self.context.to_dict()
+            if getattr(self.store, "index_members", None):
+                metadata["universe_quality"] = universe_snapshot_quality(
+                    self.store,
+                    self.context.universe_id,
+                    as_of_date,
+                )
         return PITSnapshot(as_of_date, included, financials, prices, industries, exclusions, metadata)
