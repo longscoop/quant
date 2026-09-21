@@ -190,6 +190,7 @@ def execute_target_weights(
             "side": side,
             "target_weight": float(info["target_weight"]),
             "target_quantity": target,
+            "requested_quantity": requested,
         }
         if price is None:
             records.append(
@@ -198,6 +199,7 @@ def execute_target_weights(
                     "executed_quantity": 0.0,
                     "actual_weight": 0.0,
                     "reason": "missing_open",
+                    "remaining_quantity": requested,
                 }
             )
             continue
@@ -210,6 +212,7 @@ def execute_target_weights(
                     "executed_quantity": 0.0,
                     "actual_weight": current * price / signal_value,
                     "reason": status.reason,
+                    "remaining_quantity": requested,
                 }
             )
             continue
@@ -238,6 +241,7 @@ def execute_target_weights(
                     "executed_quantity": 0.0,
                     "actual_weight": current * price / signal_value,
                     "reason": "insufficient_cash_or_position",
+                    "remaining_quantity": requested,
                 }
             )
             continue
@@ -266,6 +270,7 @@ def execute_target_weights(
                 "gross_amount": gross,
                 "fee_amount": cost_amount,
                 "cost_audit": dict(cost.audit),
+                "remaining_quantity": max(0.0, requested - float(quantity)),
             }
         )
 
