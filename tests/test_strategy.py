@@ -87,7 +87,7 @@ class StrategyTests(unittest.TestCase):
         from quant.factor_strategy import factor_predictions
 
         rows = [
-            {"ts_code": "000001.SZ", "factors": {"quality": 80, "growth": 90, "valuation": 70, "momentum": 60, "industry": 50, "risk": 40}, "availability": {"quality": True, "growth": True, "valuation": True, "momentum": True, "industry": True, "risk": True}},
+            {"ts_code": "000001.SZ", "factors": {"quality": 80, "growth": 90, "valuation": 70, "momentum": 60, "industry": 50, "low_volatility": 40, "liquidity": 70}, "availability": {"quality": True, "growth": True, "valuation": True, "momentum": True, "industry": True, "low_volatility": True, "liquidity": True}},
             {"ts_code": "000002.SZ", "factors": {"quality": 80, "growth": None, "valuation": None}, "availability": {"quality": True, "growth": False, "valuation": False}},
         ]
 
@@ -98,10 +98,20 @@ class StrategyTests(unittest.TestCase):
     def test_factor_strategy_renormalizes_available_template_weights(self):
         from quant.factor_strategy import factor_predictions
 
-        row = {"ts_code": "000001.SZ", "factors": {"quality": 80, "growth": 100, "valuation": 0, "momentum": 0, "industry": None, "risk": 0}, "availability": {"quality": True, "growth": True, "valuation": True, "momentum": True, "industry": False, "risk": True}}
+        row = {"ts_code": "000001.SZ", "factors": {"quality": 80, "growth": 100, "valuation": 0, "momentum": 0, "industry": None, "low_volatility": 0, "liquidity": 0}, "availability": {"quality": True, "growth": True, "valuation": True, "momentum": True, "industry": False, "low_volatility": True, "liquidity": True}}
         result = factor_predictions([row], date(2024, 4, 15), "quality_growth")
 
         self.assertAlmostEqual(result.rows[0].score, 41 / .85)
+    def test_factor_strategy_migrates_legacy_risk_to_low_volatility(self):
+        from quant.factor_strategy import factor_predictions
+
+        row = {"ts_code": "000001.SZ", "factors": {"quality": 80, "growth": 80, "valuation": 80, "momentum": 80, "industry": 80, "risk": 40}, "availability": {"quality": True, "growth": True, "valuation": True, "momentum": True, "industry": True, "risk": True}}
+        result = factor_predictions([row], date(2024, 4, 15), "quality_growth")
+
+        self.assertEqual(len(result.rows), 1)
+        self.assertIn("legacy_factor_aliases", result.metadata)
+        self.assertEqual(result.metadata["legacy_factor_aliases"], {"risk": "low_volatility"})
+
     def test_top_n_strategy_returns_equal_weight_tradable_positions(self):
         from quant.types import PredictionRow, PredictionSnapshot
 
