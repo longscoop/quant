@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS securities (ts_code text PRIMARY KEY, name text NOT N
 CREATE TABLE IF NOT EXISTS security_statuses (ts_code text NOT NULL, effective_from date NOT NULL, effective_to date, is_st boolean NOT NULL DEFAULT false, status_name text, PRIMARY KEY (ts_code, effective_from));
 CREATE TABLE IF NOT EXISTS price_bars (ts_code text NOT NULL, trade_date date NOT NULL, close double precision NOT NULL, adj_factor double precision NOT NULL, suspended boolean NOT NULL, limit_up boolean NOT NULL, limit_down boolean NOT NULL, volume double precision NOT NULL, open double precision, high double precision, low double precision, PRIMARY KEY (ts_code, trade_date));
 CREATE TABLE IF NOT EXISTS financials (ts_code text NOT NULL, report_period date NOT NULL, ann_date date NOT NULL, revenue double precision NOT NULL, net_profit double precision NOT NULL, roe double precision NOT NULL, gross_margin double precision NOT NULL, operating_cashflow double precision NOT NULL, debt_ratio double precision NOT NULL, PRIMARY KEY (ts_code, report_period, ann_date));
-CREATE TABLE IF NOT EXISTS industries (ts_code text NOT NULL, industry text NOT NULL, effective_date date NOT NULL, PRIMARY KEY (ts_code, effective_date));
+CREATE TABLE IF NOT EXISTS industries (ts_code text NOT NULL, industry text NOT NULL, effective_date date NOT NULL, effective_to date, PRIMARY KEY (ts_code, effective_date));
 CREATE TABLE IF NOT EXISTS ingestion_audit (dataset text NOT NULL, source text NOT NULL, status text NOT NULL, row_count integer NOT NULL, created_at timestamptz NOT NULL, error text);
 CREATE TABLE IF NOT EXISTS index_members (index_code text NOT NULL, ts_code text NOT NULL, effective_date date NOT NULL, PRIMARY KEY (index_code, ts_code, effective_date));
 CREATE TABLE IF NOT EXISTS benchmark_bars (ts_code text NOT NULL, trade_date date NOT NULL, close double precision NOT NULL, open double precision, PRIMARY KEY (ts_code, trade_date));
@@ -560,6 +560,7 @@ class PostgresStore:
                 conn.execute(f"ALTER TABLE securities ADD COLUMN IF NOT EXISTS {column}")
             conn.execute("UPDATE securities SET market_id=CASE WHEN ts_code LIKE '%.HK' THEN 'HK' WHEN ts_code LIKE '%.SH' OR ts_code LIKE '%.SZ' THEN 'CN' ELSE market_id END WHERE market_id IS NULL")
             conn.execute("UPDATE securities SET currency=CASE WHEN market_id='HK' THEN 'HKD' WHEN market_id='CN' THEN 'CNY' ELSE currency END WHERE currency IS NULL")
+            conn.execute("ALTER TABLE industries ADD COLUMN IF NOT EXISTS effective_to date")
             conn.execute("ALTER TABLE index_members ADD COLUMN IF NOT EXISTS weight double precision")
             conn.execute("ALTER TABLE benchmark_bars ADD COLUMN IF NOT EXISTS open double precision")
             for column in (
@@ -727,7 +728,7 @@ class PostgresStore:
                 for r in provider.fetch_financials():
                     conn.execute(financial_sql, (r.ts_code, r.report_period, r.ann_date, r.revenue, r.net_profit, r.roe, r.gross_margin, r.operating_cashflow, r.debt_ratio, r.roic, r.current_ratio, r.free_cashflow, r.deduct_net_profit, r.data_version))
                 conn.commit()
-            for r in provider.fetch_industries(): conn.execute("INSERT INTO industries VALUES (%s,%s,%s) ON CONFLICT (ts_code,effective_date) DO UPDATE SET industry=EXCLUDED.industry", (r.ts_code,r.industry,r.effective_date))
+            for r in provider.fetch_industries(): conn.execute("INSERT INTO industries (ts_code,industry,effective_date,effective_to) VALUES (%s,%s,%s,%s) ON CONFLICT (ts_code,effective_date) DO UPDATE SET industry=EXCLUDED.industry,effective_to=EXCLUDED.effective_to", (r.ts_code,r.industry,r.effective_date,r.effective_to))
             valuation_sql = "INSERT INTO valuation_bars VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ts_code,trade_date) DO UPDATE SET pe_ttm=EXCLUDED.pe_ttm,pb=EXCLUDED.pb,ps_ttm=EXCLUDED.ps_ttm,dividend_yield=EXCLUDED.dividend_yield,turnover_rate=EXCLUDED.turnover_rate,data_version=EXCLUDED.data_version"
             if hasattr(provider, "iter_valuation_batches"):
                 for code, batch in provider.iter_valuation_batches(skip_codes=valuation_skip):
@@ -768,7 +769,7 @@ class PostgresStore:
                 record = PriceBar(*row); store.prices[(record.ts_code, record.trade_date)] = record
             for row in conn.execute("SELECT ts_code,report_period,ann_date,revenue,net_profit,roe,gross_margin,operating_cashflow,debt_ratio,roic,current_ratio,free_cashflow,deduct_net_profit,data_version FROM financials"):
                 record = FinancialRecord(*row); store.financials[(record.ts_code, record.report_period, record.ann_date)] = record
-            for row in conn.execute("SELECT ts_code,industry,effective_date FROM industries"):
+            for row in conn.execute("SELECT ts_code,industry,effective_date,effective_to FROM industries"):
                 record = IndustryRecord(*row); store.industries[(record.ts_code, record.effective_date)] = record
             for row in conn.execute("SELECT index_code,ts_code,effective_date FROM index_members"):
                 index_code, ts_code, effective_date = row
@@ -822,7 +823,7 @@ class PostgresStore:
             if codes:
                 industry_clause, industry_params = " WHERE ts_code = ANY(%s)", [codes]
             for row in conn.execute(
-                f"SELECT ts_code,industry,effective_date FROM industries{industry_clause} ORDER BY ts_code,effective_date",
+                f"SELECT ts_code,industry,effective_date,effective_to FROM industries{industry_clause} ORDER BY ts_code,effective_date",
                 industry_params,
             ):
                 record = IndustryRecord(*row); store.industries[(record.ts_code, record.effective_date)] = record
@@ -860,7 +861,7 @@ class PostgresStore:
                 record = Security(*row)
                 store.securities[record.ts_code] = record
             for row in conn.execute(
-                "SELECT ts_code,industry,effective_date FROM industries WHERE ts_code = ANY(%s) AND effective_date<=%s ORDER BY ts_code,effective_date",
+                "SELECT ts_code,industry,effective_date,effective_to FROM industries WHERE ts_code = ANY(%s) AND effective_date<=%s ORDER BY ts_code,effective_date",
                 (codes, valuation_date),
             ):
                 record = IndustryRecord(*row)

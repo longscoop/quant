@@ -126,6 +126,7 @@ class IndustryRecord:
     ts_code: str
     industry: str
     effective_date: date
+    effective_to: date | None = None
 
 
 @dataclass(frozen=True)

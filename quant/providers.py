@@ -384,7 +384,7 @@ class TushareProvider(DataProvider):
     def fetch_industries(self) -> list[IndustryRecord]:
         frame = self._request("stock_basic", exchange="", list_status="L", fields="ts_code,industry")
         allowed = set(self._codes())
-        return [IndustryRecord(r.ts_code, getattr(r, "industry", "UNKNOWN") or "UNKNOWN", self.start_date) for r in frame.itertuples() if r.ts_code in allowed]
+        return [IndustryRecord(r.ts_code, getattr(r, "industry", "UNKNOWN") or "UNKNOWN", self.end_date) for r in frame.itertuples() if r.ts_code in allowed]
 
     def fetch_benchmark(self, ts_code: str = "000300.SH") -> list[BenchmarkBar]:
         frame = self._request("index_daily", ts_code=ts_code, start_date=self.start_date.strftime("%Y%m%d"), end_date=self.end_date.strftime("%Y%m%d"))

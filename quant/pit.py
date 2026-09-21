@@ -47,7 +47,7 @@ class PITRepository:
             for record in visible: by_period[record.report_period].append(record)
             latest_period = max(by_period)
             latest = max(by_period[latest_period], key=lambda f: f.ann_date)
-            industry_versions = [i for i in self.store.industry_for(code) if i.effective_date <= as_of_date]
+            industry_versions = [i for i in self.store.industry_for(code) if i.effective_date <= as_of_date and (i.effective_to is None or as_of_date <= i.effective_to)]
             included.append(security); financials.append(latest); prices[code] = history
             industries[code] = max(industry_versions, key=lambda i: i.effective_date).industry if industry_versions else "UNKNOWN"
         metadata = {"pit_safe": True, "data_version": len(self.store.audit)}

@@ -311,7 +311,7 @@ def portfolio_dashboard(store, portfolio_id: str, valuation_date: date | None = 
     industry_map = {}
     if selected_date is not None:
         for code in memory.securities:
-            records = [row for row in memory.industry_for(code) if row.effective_date <= selected_date]
+            records = [row for row in memory.industry_for(code) if row.effective_date <= selected_date and (row.effective_to is None or selected_date <= row.effective_to)]
             if records:
                 industry_map[code] = max(records, key=lambda row: row.effective_date).industry
     total_value = float(selected_nav["total_value"]) if selected_nav and selected_nav.get("total_value") is not None else None
