@@ -620,12 +620,29 @@ def build_factor_run(
             "universe_id": context.universe_id if context is not None else "hs300",
             "context": context.to_dict() if context is not None else None,
         }
-        payload = {"rows": [{"as_of_date": row.as_of_date, "ts_code": row.ts_code, "values": row.values} for row in features.rows], "rankings": rankings, "metadata": metadata}
+        serialized_rows = [
+            {"as_of_date": row.as_of_date, "ts_code": row.ts_code, "values": row.values}
+            for row in features.rows
+        ]
+        payload = {"rankings": rankings, "metadata": metadata}
+        external_row_storage = hasattr(store, "record_factor_run_rows")
+        if external_row_storage:
+            payload["row_storage"] = {
+                "kind": "factor_run_items",
+                "row_count": len(features.rows),
+                "factor_version": metadata.get("factor_model_version"),
+            }
+        else:
+            payload["rows"] = serialized_rows
+
         status = "completed" if features.rows or rankings else "not_trainable"
         parameters = {"as_of_dates": usable_dates}
         if context is not None:
             parameters["context"] = context.to_dict()
-        return store.record_run("factors", status, sanitize_for_storage(parameters), sanitize_for_storage(payload))
+        run_id = store.record_run("factors", status, sanitize_for_storage(parameters), sanitize_for_storage(payload))
+        if external_row_storage and features.rows:
+            store.record_factor_run_rows(run_id, features.rows)
+        return run_id
     except Exception as exc:
         return store.record_run("factors", "failed", sanitize_for_storage({"as_of_dates": as_of_dates}), error=sanitize_sensitive_text(str(exc)))
 

@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS ingestion_audit (dataset text NOT NULL, source text N
 CREATE TABLE IF NOT EXISTS index_members (index_code text NOT NULL, ts_code text NOT NULL, effective_date date NOT NULL, PRIMARY KEY (index_code, ts_code, effective_date));
 CREATE TABLE IF NOT EXISTS benchmark_bars (ts_code text NOT NULL, trade_date date NOT NULL, close double precision NOT NULL, open double precision, PRIMARY KEY (ts_code, trade_date));
 CREATE TABLE IF NOT EXISTS research_runs (run_id uuid PRIMARY KEY, run_type text NOT NULL, status text NOT NULL, parameters jsonb NOT NULL DEFAULT '{}'::jsonb, payload jsonb NOT NULL DEFAULT '{}'::jsonb, error text, created_at timestamptz NOT NULL, completed_at timestamptz);
+CREATE TABLE IF NOT EXISTS factor_run_items (run_id uuid NOT NULL REFERENCES research_runs(run_id) ON DELETE CASCADE, as_of_date date NOT NULL, ts_code text NOT NULL, values jsonb NOT NULL, PRIMARY KEY (run_id, as_of_date, ts_code));
 CREATE TABLE IF NOT EXISTS factor_snapshots (snapshot_id uuid PRIMARY KEY, as_of_date date NOT NULL, factor_version text NOT NULL, pit_version text NOT NULL, universe_version text NOT NULL, status text NOT NULL, coverage double precision, audit jsonb NOT NULL DEFAULT '{}'::jsonb, created_at timestamptz NOT NULL DEFAULT NOW(), completed_at timestamptz, error text, UNIQUE (as_of_date, factor_version, pit_version, universe_version));
 CREATE TABLE IF NOT EXISTS factor_snapshot_items (snapshot_id uuid NOT NULL REFERENCES factor_snapshots(snapshot_id) ON DELETE CASCADE, ts_code text NOT NULL, factors jsonb NOT NULL, availability jsonb NOT NULL, audit jsonb NOT NULL DEFAULT '{}'::jsonb, PRIMARY KEY (snapshot_id, ts_code));
 CREATE TABLE IF NOT EXISTS valuation_bars (ts_code text NOT NULL, trade_date date NOT NULL, pe_ttm double precision, pb double precision, ps_ttm double precision, dividend_yield double precision, turnover_rate double precision, data_version text NOT NULL DEFAULT 'pit_v1.0', PRIMARY KEY (ts_code, trade_date));
@@ -566,6 +567,24 @@ class InMemoryStore:
 
     def get_portfolio_positions(self, portfolio_id: str = "default") -> list[dict]:
         return sorted((dict(row) for (pid, _), row in self.portfolio_positions.items() if pid == portfolio_id), key=lambda row: row["ts_code"])
+
+    def record_factor_run_rows(self, run_id: str, rows) -> int:
+        self.initialize()
+        normalized = list(rows)
+        if not normalized:
+            return 0
+        with self._connect() as conn:
+            for row in normalized:
+                conn.execute(
+                    "INSERT INTO factor_run_items (run_id,as_of_date,ts_code,values) VALUES (%s,%s,%s,%s::jsonb) ON CONFLICT (run_id,as_of_date,ts_code) DO UPDATE SET values=EXCLUDED.values",
+                    (
+                        run_id,
+                        row.as_of_date,
+                        row.ts_code,
+                        json.dumps(sanitize_for_storage(row.values), default=str),
+                    ),
+                )
+        return len(normalized)
 
     def get_factor_snapshot(self, as_of_date, factor_version: str, pit_version: str, universe_version: str, context=None) -> dict | None:
         prefix = (as_of_date, factor_version, pit_version, universe_version)
