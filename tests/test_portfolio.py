@@ -302,7 +302,7 @@ class PortfolioWorkflowTests(unittest.TestCase):
         save_portfolio_targets(self.store, self.portfolio_id, {"000001.SZ": 0.5})
         execution_date = self._add_next_bar(open_price=15.0)
         self.store.benchmarks[("000300.SH", execution_date)] = BenchmarkBar("000300.SH", execution_date, 4_350.0, 4_330.0)
-        factors = {"quality": 80.0, "growth": 70.0, "valuation": 60.0, "momentum": 50.0, "industry": 40.0, "risk": 30.0}
+        factors = {"quality": 80.0, "growth": 70.0, "valuation": 60.0, "momentum": 50.0, "industry": 40.0, "low_volatility": 30.0, "liquidity": 30.0}
         self.store.record_factor_snapshot(
             {"as_of_date": date(2024, 6, 15), "factor_version": "pit_v1.0", "pit_version": "pit_v1.0", "universe_version": "hs300:test", "status": "completed", "coverage": 1.0},
             [{"ts_code": "000001.SZ", "factors": factors, "availability": {name: True for name in factors}}],
