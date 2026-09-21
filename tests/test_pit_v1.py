@@ -3,6 +3,13 @@ from datetime import date
 
 
 class PitV1ScoringTests(unittest.TestCase):
+    def test_snapshot_coverage_has_valid_degraded_and_invalid_bands(self):
+        from quant.factor_snapshots import classify_snapshot_coverage
+
+        self.assertEqual(classify_snapshot_coverage(.90), ("completed", "VALID"))
+        self.assertEqual(classify_snapshot_coverage(.85), ("degraded", "DEGRADED"))
+        self.assertEqual(classify_snapshot_coverage(.79), ("invalid", "INVALID"))
+
     def test_factor_dimensions_are_canonical_and_versioned(self):
         from quant.factors_v1 import FACTOR_METRICS
         from quant.scoring import FACTOR_MODEL_VERSION
