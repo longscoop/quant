@@ -166,7 +166,7 @@ class WorkbenchInsightsTests(unittest.TestCase):
         store = RunStore()
         for day in (date(2024, 1, 31), date(2024, 2, 29), date(2024, 3, 29)):
             store.benchmarks[("000300.SH", day)] = BenchmarkBar("000300.SH", day, 4000.0, 3990.0)
-        store.record_factor_snapshot({"as_of_date": date(2024, 2, 29), "factor_version": "pit_v1.0", "pit_version": "pit_v1.0", "universe_version": "hs300:e3b0c44298fc1c14", "status": "completed"}, [])
+        store.record_factor_snapshot({"as_of_date": date(2024, 2, 29), "factor_version": "pit_v1.1", "pit_version": "pit_v1.0", "universe_version": "hs300:e3b0c44298fc1c14", "status": "completed"}, [])
         snapshots = {
             date(2024, 1, 31): {"status": "completed", "items": [{"ts_code": "000001.SZ"}], "reused": False},
             date(2024, 2, 29): {"status": "completed", "items": [{"ts_code": "000001.SZ"}], "reused": True},
