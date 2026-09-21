@@ -3,6 +3,48 @@ from datetime import date
 
 
 class PitV1ScoringTests(unittest.TestCase):
+    def test_factor_dimensions_are_canonical_and_versioned(self):
+        from quant.factors_v1 import FACTOR_METRICS
+        from quant.scoring import FACTOR_MODEL_VERSION
+        from quant.templates import TEMPLATES
+
+        expected = {"valuation", "quality", "growth", "momentum", "low_volatility", "liquidity", "industry"}
+        self.assertEqual(set(FACTOR_METRICS), expected)
+        self.assertEqual(FACTOR_MODEL_VERSION, "pit_v1.1")
+        for strategy in TEMPLATES.values():
+            self.assertEqual(set(strategy.weights), expected)
+            self.assertAlmostEqual(sum(strategy.weights.values()), 1.0)
+
+    def test_industry_metrics_are_shared_by_members_and_require_enough_peers(self):
+        from quant.factors_v1 import _industry_metrics
+
+        raw = {
+            "A": {"m_20": .20, "m_60": .10, "m_120": .05, "g_profit_yoy": .30, "v_pe": 10.0},
+            "B": {"m_20": .10, "m_60": .05, "m_120": .02, "g_profit_yoy": .20, "v_pe": 12.0},
+            "C": {"m_20": .05, "m_60": -.02, "m_120": .01, "g_profit_yoy": .10, "v_pe": 14.0},
+            "D": {"m_20": .01, "m_60": .01, "m_120": .01, "g_profit_yoy": .05, "v_pe": 30.0},
+            "E": {"m_20": .01, "m_60": .01, "m_120": .01, "g_profit_yoy": .05, "v_pe": 31.0},
+        }
+        industries = {"A": "Bank", "B": "Bank", "C": "Bank", "D": "Tech", "E": "Tech"}
+        metrics = _industry_metrics(raw, industries, min_members=3)
+
+        self.assertEqual(metrics["A"], metrics["B"])
+        self.assertEqual(metrics["B"], metrics["C"])
+        self.assertIn("i_momentum", metrics["A"])
+        self.assertIn("i_growth", metrics["A"])
+        self.assertIn("i_breadth", metrics["A"])
+        self.assertIn("i_valuation", metrics["A"])
+        self.assertEqual(metrics["D"], {})
+        self.assertEqual(metrics["E"], {})
+
+    def test_liquidity_and_low_volatility_are_separate_factor_inputs(self):
+        from quant.factors_v1 import _factor_metric_groups
+
+        groups = _factor_metric_groups()
+        self.assertEqual(groups["low_volatility"], ("r_volatility", "r_drawdown"))
+        self.assertEqual(groups["liquidity"], ("l_turnover",))
+        self.assertNotIn("l_turnover", groups["low_volatility"])
+
     def test_drawdown_risk_scores_smaller_losses_higher(self):
         from quant.factors_v1 import _max_drawdown_loss, _percentiles
 
@@ -66,10 +108,10 @@ class PitV1ScoringTests(unittest.TestCase):
         store = RunStore(); store.sync(FixtureProvider())
         build_factor_run(store, [date(2024, 3, 15), date(2024, 4, 15)])
 
-        self.assertEqual(store.run["payload"]["metadata"]["factor_model_version"], "pit_v1.0")
+        self.assertEqual(store.run["payload"]["metadata"]["factor_model_version"], "pit_v1.1")
         self.assertEqual(store.run["payload"]["rankings"][0]["strategy_template_id"], "quality_growth")
         self.assertGreater(len(store.run["payload"]["rows"]), 0)
-        self.assertTrue(all(key[0] in {"q", "g", "v", "m", "r"} for key in store.run["payload"]["rows"][0]["values"]))
+        self.assertTrue(all(key[0] in {"q", "g", "v", "m", "r", "l", "i"} for key in store.run["payload"]["rows"][0]["values"]))
 
     def test_pit_uses_latest_hs300_membership_snapshot(self):
         from quant.markets import ResearchContext
