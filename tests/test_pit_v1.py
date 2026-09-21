@@ -150,6 +150,42 @@ class PitV1ScoringTests(unittest.TestCase):
         self.assertGreater(len(store.run["payload"]["rows"]), 0)
         self.assertTrue(all(key[0] in {"q", "g", "v", "m", "r", "l", "i"} for key in store.run["payload"]["rows"][0]["values"]))
 
+    def test_universe_quality_reports_exact_historical_snapshot_evidence(self):
+        from quant.pit import universe_snapshot_quality
+        from quant.storage import InMemoryStore
+        from quant.types import Security
+
+        store = InMemoryStore()
+        store.securities["000001.SZ"] = Security("000001.SZ", "Alpha", date(2010, 1, 1))
+        store.sync_index_members(
+            "000300.SH",
+            [
+                ("000001.SZ", date(2024, 3, 1)),
+                ("000002.SZ", date(2024, 3, 1)),
+                ("000001.SZ", date(2024, 4, 1)),
+            ],
+        )
+
+        report = universe_snapshot_quality(store, "000300.SH", date(2024, 4, 15))
+
+        self.assertEqual(report["snapshot_date"], date(2024, 4, 1))
+        self.assertEqual(report["member_count"], 1)
+        self.assertEqual(report["missing_security_codes"], [])
+        self.assertEqual(report["status"], "valid")
+
+    def test_universe_quality_never_falls_forward_to_future_snapshot(self):
+        from quant.pit import universe_snapshot_quality
+        from quant.storage import InMemoryStore
+
+        store = InMemoryStore()
+        store.sync_index_members("000300.SH", [("000001.SZ", date(2024, 5, 1))])
+
+        report = universe_snapshot_quality(store, "000300.SH", date(2024, 4, 15))
+
+        self.assertIsNone(report["snapshot_date"])
+        self.assertEqual(report["status"], "invalid")
+        self.assertEqual(report["reason"], "missing_historical_snapshot")
+
     def test_pit_uses_latest_hs300_membership_snapshot(self):
         from quant.markets import ResearchContext
         from quant.markets.cn import CnUniverseProvider
