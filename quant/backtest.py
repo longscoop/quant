@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from math import sqrt
 from statistics import mean, pstdev
 
+from .execution import target_weight_turnover
 from .pit import PITRepository
 from .strategy import StrategyConfig, select_positions
 from .types import BacktestResult, PredictionSnapshot
@@ -39,7 +40,8 @@ def run_backtest(
     skip_invalid_periods: bool = False,
     progress=None,
 ) -> BacktestResult:
-    positions, trades, dates, returns, benchmark_returns, skipped = [], [], [], [], [], []
+    positions, trades, dates, returns, benchmark_returns, skipped, turnovers = [], [], [], [], [], [], []
+    previous_target_weights: dict[str, float] = {}
     rebalances = sorted({row.as_of_date for row in prediction_snapshot.rows})
     benchmark_by_date = {bar.trade_date: bar for bar in pit.store.benchmark_for(config.benchmark)}
 
@@ -111,11 +113,19 @@ def run_backtest(
             if rejected is not None:
                 return rejected
             continue
+        target_weights = {position.ts_code: float(position.weight) for position in period_positions}
+        turnover = target_weight_turnover(previous_target_weights, target_weights)
+        transaction_cost = turnover * config.transaction_cost_bps / 10_000
+        for trade in period_trades:
+            trade["turnover"] = turnover
+            trade["transaction_cost_fraction"] = transaction_cost
         positions.extend(period_positions)
         trades.extend(period_trades)
         dates.append(rebalance_date)
-        returns.append(gross - config.transaction_cost_bps / 10000)
+        returns.append(gross - transaction_cost)
         benchmark_returns.append(benchmark_by_date[exit_date].close / benchmark_by_date[entry_date].open - 1)
+        turnovers.append(turnover)
+        previous_target_weights = target_weights
         if progress:
             progress({"event": "period_completed", "current": index + 1, "total": len(rebalances), "date": rebalance_date, "execution_date": entry_date})
     if not returns:
@@ -128,5 +138,8 @@ def run_backtest(
     volatility, benchmark_volatility = (pstdev(returns) if len(returns) > 1 else 0.0), (pstdev(benchmark_returns) if len(benchmark_returns) > 1 else 0.0)
     annualized, benchmark_annualized = value ** (12 / len(returns)) - 1, benchmark_value ** (12 / len(returns)) - 1
     drawdown, benchmark_drawdown = _drawdown(equity), _drawdown(benchmark_curve)
-    metrics = {"total_return": value - 1, "annualized_return": annualized, "annualized_volatility": volatility * sqrt(12) if volatility else None, "benchmark_return": benchmark_value - 1, "benchmark_annualized_return": benchmark_annualized, "excess_return": value - benchmark_value, "sharpe": mean(returns) / volatility * sqrt(12) if volatility else None, "benchmark_sharpe": mean(benchmark_returns) / benchmark_volatility * sqrt(12) if benchmark_volatility else None, "max_drawdown": drawdown, "benchmark_max_drawdown": benchmark_drawdown, "calmar": annualized / abs(drawdown) if drawdown else None, "benchmark_calmar": benchmark_annualized / abs(benchmark_drawdown) if benchmark_drawdown else None, "turnover": 1.0, "annualized_turnover": 12.0}
+    total_turnover = sum(turnovers)
+    annualized_turnover = total_turnover * 12 / len(turnovers) if turnovers else None
+    total_transaction_cost = sum(turnover * config.transaction_cost_bps / 10_000 for turnover in turnovers)
+    metrics = {"total_return": value - 1, "annualized_return": annualized, "annualized_volatility": volatility * sqrt(12) if volatility else None, "benchmark_return": benchmark_value - 1, "benchmark_annualized_return": benchmark_annualized, "excess_return": value - benchmark_value, "sharpe": mean(returns) / volatility * sqrt(12) if volatility else None, "benchmark_sharpe": mean(benchmark_returns) / benchmark_volatility * sqrt(12) if benchmark_volatility else None, "max_drawdown": drawdown, "benchmark_max_drawdown": benchmark_drawdown, "calmar": annualized / abs(drawdown) if drawdown else None, "benchmark_calmar": benchmark_annualized / abs(benchmark_drawdown) if benchmark_drawdown else None, "turnover": total_turnover, "annualized_turnover": annualized_turnover, "total_transaction_cost": total_transaction_cost}
     return BacktestResult(positions, equity, metrics, trades, benchmark_curve, excess_curve, _yearly(equity, benchmark_curve), skipped_periods=skipped)
