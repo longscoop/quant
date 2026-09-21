@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from .scoring import FACTOR_MODEL_VERSION\nfrom .types import StrategyTemplate
+from .scoring import FACTOR_MODEL_VERSION
+from .types import StrategyTemplate
 
 
 _VERSION = FACTOR_MODEL_VERSION

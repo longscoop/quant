@@ -6,7 +6,8 @@ from dataclasses import asdict, dataclass
 from typing import Mapping
 
 
-FACTOR_MODEL_VERSION = "pit_v1.1"\nPIT_DATA_VERSION = "pit_v1.0"
+FACTOR_MODEL_VERSION = "pit_v1.1"
+PIT_DATA_VERSION = "pit_v1.0"
 MIN_FACTOR_COVERAGE = 0.50
 MIN_COMPOSITE_COVERAGE = 0.70
 

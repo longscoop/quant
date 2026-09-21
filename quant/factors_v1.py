@@ -12,7 +12,20 @@ from .scoring import FACTOR_MODEL_VERSION, PIT_DATA_VERSION, blended_percentile,
 from .templates import template
 
 
-FACTOR_METRIC_GROUPS = {\n    "quality": ("q_roe", "q_roic", "q_margin", "q_ocf_profit", "q_fcf_profit", "q_debt", "q_current", "q_accrual"),\n    "growth": ("g_revenue_yoy", "g_profit_yoy", "g_deduct_yoy", "g_ocf_yoy", "g_revenue_cagr", "g_profit_cagr", "g_revenue_accel", "g_profit_accel"),\n    "valuation": ("v_pe", "v_pb", "v_ps", "v_dividend", "v_peg"),\n    "momentum": ("m_20", "m_60", "m_120"),\n    "low_volatility": ("r_volatility", "r_drawdown"),\n    "liquidity": ("l_turnover",),\n    "industry": ("i_momentum", "i_growth", "i_breadth", "i_valuation"),\n}\nFACTOR_METRICS = {name: len(metrics) for name, metrics in FACTOR_METRIC_GROUPS.items()}\n\n\ndef _factor_metric_groups() -> dict[str, tuple[str, ...]]:\n    return dict(FACTOR_METRIC_GROUPS)
+FACTOR_METRIC_GROUPS = {
+    "quality": ("q_roe", "q_roic", "q_margin", "q_ocf_profit", "q_fcf_profit", "q_debt", "q_current", "q_accrual"),
+    "growth": ("g_revenue_yoy", "g_profit_yoy", "g_deduct_yoy", "g_ocf_yoy", "g_revenue_cagr", "g_profit_cagr", "g_revenue_accel", "g_profit_accel"),
+    "valuation": ("v_pe", "v_pb", "v_ps", "v_dividend", "v_peg"),
+    "momentum": ("m_20", "m_60", "m_120"),
+    "low_volatility": ("r_volatility", "r_drawdown"),
+    "liquidity": ("l_turnover",),
+    "industry": ("i_momentum", "i_growth", "i_breadth", "i_valuation"),
+}
+FACTOR_METRICS = {name: len(metrics) for name, metrics in FACTOR_METRIC_GROUPS.items()}
+
+
+def _factor_metric_groups() -> dict[str, tuple[str, ...]]:
+    return dict(FACTOR_METRIC_GROUPS)
 INDUSTRY_BLEND = {"quality": (.60, .40), "growth": (.50, .50), "valuation": (.70, .30)}
 
 
@@ -147,10 +160,15 @@ def build_rankings(memory, as_of: date, template_id: str = "quality_growth", *, 
             else:
                 percentiles[code][metric] = universe.get(code)
     result = []
-    groups = {"quality": "q_", "growth": "g_", "valuation": "v_", "momentum": "m_", "risk": "r_"}
     for code in codes:
-        factors = {name: factor_score(name, {metric: value for metric, value in percentiles[code].items() if metric.startswith(prefix)}, total_metrics=FACTOR_METRICS[name]) for name, prefix in groups.items()}
-        factors["industry"] = factor_score("industry", {}, total_metrics=FACTOR_METRICS["industry"])
+        factors = {
+            name: factor_score(
+                name,
+                {metric: percentiles[code].get(metric) for metric in metrics if metric in percentiles[code]},
+                total_metrics=FACTOR_METRICS[name],
+            )
+            for name, metrics in FACTOR_METRIC_GROUPS.items()
+        }
         composite = composite_score(factors, strategy.weights)
         result.append({"ts_code": code, "as_of_date": as_of.isoformat(), "tradable_date": next_trading_day(as_of, sorted({bar.trade_date for bar in memory.prices.values()})).isoformat() if next_trading_day(as_of, sorted({bar.trade_date for bar in memory.prices.values()})) else None, "factor_model_version": FACTOR_MODEL_VERSION, "strategy_template_id": strategy.template_id, "factors": {name: score.to_dict() for name, score in factors.items()}, "score": composite.to_dict(), "metrics": percentiles[code]})
     return sorted(result, key=lambda row: row["score"]["score"] if row["score"]["score"] is not None else -1, reverse=True)

@@ -19,7 +19,8 @@ from .factors_v1 import build_rankings
 from .legacy.model import ModelTrainer
 from .labels import attach_forward_excess_return_labels
 from .markets import MarketConfig, ResearchContext, TimeSplitConfig, get_market
-from .pit import PITRepository\nfrom .scoring import FACTOR_MODEL_VERSION, PIT_DATA_VERSION
+from .pit import PITRepository
+from .scoring import FACTOR_MODEL_VERSION, PIT_DATA_VERSION
 from .providers import TushareProvider
 from .ingestion import SyncMode, sync_window
 from .scheduler import DailySchedule, SHANGHAI
