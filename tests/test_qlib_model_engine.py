@@ -283,6 +283,15 @@ class QlibModelWorkflowTest(unittest.TestCase):
         self.assertEqual(store.saved_run["status"], "completed")
         self.assertEqual(store.saved_run["payload"]["metadata"]["engine"], "qlib.contrib.model.gbdt.LGBModel")
         self.assertEqual(store.saved_run["payload"]["metadata"]["recorder_id"], "recorder-workflow")
+        registry = store.saved_run["payload"]["metadata"]["registry_contract"]
+        self.assertEqual(registry["schema_version"], "model_run_v2")
+        self.assertEqual(registry["context"], context.to_dict())
+        self.assertEqual(registry["feature_snapshot"]["run_id"], "factor-1")
+        self.assertEqual(registry["label"]["definition"], "T+1_OPEN_TO_T+20_CLOSE_EXCESS")
+        self.assertEqual(registry["split"]["requested"]["calendar_id"], "CN_A_SHARE")
+        self.assertIn("model_params", registry)
+        self.assertEqual(registry["artifacts"]["recorder_id"], "recorder-workflow")
+        self.assertEqual(registry["oos_metrics"]["rank_ic"], 0.2)
         self.assertEqual(len(store.saved_run["payload"]["rows"]), 2)
         self.assertEqual(
             set(store.saved_run["payload"]["rows"][0]),
