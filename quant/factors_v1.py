@@ -8,11 +8,11 @@ from math import isfinite, sqrt
 from statistics import mean, pstdev
 
 from .pit_v1 import next_trading_day
-from .scoring import FACTOR_MODEL_VERSION, blended_percentile, composite_score, factor_score
+from .scoring import FACTOR_MODEL_VERSION, PIT_DATA_VERSION, blended_percentile, composite_score, factor_score
 from .templates import template
 
 
-FACTOR_METRICS = {"quality": 8, "growth": 8, "valuation": 5, "momentum": 3, "industry": 4, "risk": 4}
+FACTOR_METRIC_GROUPS = {\n    "quality": ("q_roe", "q_roic", "q_margin", "q_ocf_profit", "q_fcf_profit", "q_debt", "q_current", "q_accrual"),\n    "growth": ("g_revenue_yoy", "g_profit_yoy", "g_deduct_yoy", "g_ocf_yoy", "g_revenue_cagr", "g_profit_cagr", "g_revenue_accel", "g_profit_accel"),\n    "valuation": ("v_pe", "v_pb", "v_ps", "v_dividend", "v_peg"),\n    "momentum": ("m_20", "m_60", "m_120"),\n    "low_volatility": ("r_volatility", "r_drawdown"),\n    "liquidity": ("l_turnover",),\n    "industry": ("i_momentum", "i_growth", "i_breadth", "i_valuation"),\n}\nFACTOR_METRICS = {name: len(metrics) for name, metrics in FACTOR_METRIC_GROUPS.items()}\n\n\ndef _factor_metric_groups() -> dict[str, tuple[str, ...]]:\n    return dict(FACTOR_METRIC_GROUPS)
 INDUSTRY_BLEND = {"quality": (.60, .40), "growth": (.50, .50), "valuation": (.70, .30)}
 
 
@@ -30,7 +30,7 @@ def _percentiles(values: dict[str, float], higher_is_better: bool = True) -> dic
 
 
 def _financial_history(memory, code, as_of, trading_days):
-    return [item for item in memory.financials_for(code) if item.data_version == FACTOR_MODEL_VERSION and (next_trading_day(item.ann_date, trading_days) or date.max) <= as_of]
+    return [item for item in memory.financials_for(code) if item.data_version == PIT_DATA_VERSION and (next_trading_day(item.ann_date, trading_days) or date.max) <= as_of]
 
 
 def _latest(items):
@@ -77,7 +77,7 @@ def _metrics(memory, codes, as_of, benchmark_id):
         financials = _financial_history(memory, code, as_of, trading_days)
         current = _latest(financials)
         prices = [bar for bar in memory.prices_for(code) if bar.trade_date <= as_of]
-        valuation_rows = [bar for bar in memory.valuations_for(code) if bar.trade_date <= as_of and bar.data_version == FACTOR_MODEL_VERSION]
+        valuation_rows = [bar for bar in memory.valuations_for(code) if bar.trade_date <= as_of and bar.data_version == PIT_DATA_VERSION]
         valuation = max(valuation_rows, key=lambda bar: bar.trade_date) if valuation_rows else None
         if current:
             raw[code].update({
@@ -100,7 +100,7 @@ def _metrics(memory, codes, as_of, benchmark_id):
                 raw[code]["g_revenue_accel"] = raw[code]["g_revenue_yoy"] - _growth(previous.revenue, before.revenue) if before and raw[code]["g_revenue_yoy"] is not None and _growth(previous.revenue, before.revenue) is not None else None
                 raw[code]["g_profit_accel"] = raw[code]["g_profit_yoy"] - _growth(previous.net_profit, before.net_profit) if before and raw[code]["g_profit_yoy"] is not None and _growth(previous.net_profit, before.net_profit) is not None else None
         if valuation:
-            history = [bar for bar in memory.valuations_for(code) if bar.trade_date <= as_of and bar.data_version == FACTOR_MODEL_VERSION]
+            history = [bar for bar in memory.valuations_for(code) if bar.trade_date <= as_of and bar.data_version == PIT_DATA_VERSION]
             raw[code].update({
                 "v_pe": valuation.pe_ttm, "v_pb": valuation.pb, "v_ps": valuation.ps_ttm, "v_dividend": valuation.dividend_yield,
                 "v_peg": _ratio(valuation.pe_ttm, raw[code].get("g_profit_yoy")),

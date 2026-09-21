@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date
 
 from .factors_v1 import build_rankings
-from .markets import MarketConfig, ResearchContext
+from .markets import MarketConfig, ResearchContext\nfrom .scoring import FACTOR_MODEL_VERSION, PIT_DATA_VERSION
 
 
 def ensure_factor_snapshot(

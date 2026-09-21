@@ -29,4 +29,4 @@ def factor_predictions(
         score = sum(float(factors[name]) * weights[name] for name in available) / available_weight
         rows.append(PredictionRow(as_of_date, str(item["ts_code"]), score))
         coverage_by_code[str(item["ts_code"])] = available_weight
-    return PredictionSnapshot(rows, {"strategy_type": "FACTOR", "template_id": template_id, "min_coverage": min_coverage, "coverage_by_code": coverage_by_code})
+    return PredictionSnapshot(rows, {"strategy_type": "FACTOR", "template_id": template_id, "min_coverage": min_coverage, "coverage_by_code": coverage_by_code, "legacy_factor_aliases": dict(LEGACY_FACTOR_ALIASES)})

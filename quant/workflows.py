@@ -19,7 +19,7 @@ from .factors_v1 import build_rankings
 from .legacy.model import ModelTrainer
 from .labels import attach_forward_excess_return_labels
 from .markets import MarketConfig, ResearchContext, TimeSplitConfig, get_market
-from .pit import PITRepository
+from .pit import PITRepository\nfrom .scoring import FACTOR_MODEL_VERSION, PIT_DATA_VERSION
 from .providers import TushareProvider
 from .ingestion import SyncMode, sync_window
 from .scheduler import DailySchedule, SHANGHAI
@@ -576,7 +576,7 @@ def build_factor_run(
             ]
             features = FeatureSnapshot(feature_rows, {
                 "pit_safe": True,
-                "factor_version": "pit_v1.0",
+                "factor_version": FACTOR_MODEL_VERSION,
                 "row_count": len(feature_rows),
                 "template_neutral": True,
                 "context": context.to_dict(),
@@ -593,14 +593,14 @@ def build_factor_run(
                 FactorRow(day, row["ts_code"], {
                     name: value
                     for name, value in row.get("metrics", {}).items()
-                    if name.startswith(("q_", "g_", "v_", "m_", "r_"))
+                    if name.startswith(("q_", "g_", "v_", "m_", "r_", "l_", "i_"))
                 })
                 for day, day_rankings in rankings_by_date.items()
                 for row in day_rankings
             ]
             features = FeatureSnapshot(feature_rows, {
                 "pit_safe": True,
-                "factor_version": "pit_v1.0",
+                "factor_version": FACTOR_MODEL_VERSION,
                 "row_count": len(feature_rows),
                 "template_neutral": True,
             })
@@ -613,7 +613,7 @@ def build_factor_run(
             "date_start": usable_dates[0].isoformat() if usable_dates else None,
             "date_end": usable_dates[-1].isoformat() if usable_dates else None,
             "security_count": len({row.ts_code for row in features.rows}) or len({row["ts_code"] for row in rankings}),
-            "factor_model_version": "pit_v1.0" if has_v1_financials else "legacy-v0",
+            "factor_model_version": FACTOR_MODEL_VERSION if has_v1_financials else "legacy-v0",
             "strategy_template_id": "quality_growth",
             "data_snapshot_id": f"audit-{len(memory.audit)}",
             "universe_id": context.universe_id if context is not None else "hs300",
@@ -946,7 +946,7 @@ def run_backtest_run(
         result = run_backtest(BacktestConfig(top_n=top_n, transaction_cost_bps=cost_bps), prediction, PITRepository(store.load_memory()))
         output = {"metrics": result.metrics, "equity_curve": [{"date": day, "value": value} for day, value in result.equity_curve], "benchmark_curve": [{"date": day, "value": value} for day, value in result.benchmark_curve], "excess_curve": [{"date": day, "value": value} for day, value in result.excess_curve], "annual_returns": result.annual_returns, "positions": [position.__dict__ for position in result.positions], "trades": result.trades, "status_reason": result.status_reason}
         status = "completed" if result.status_reason is None else "not_trainable"
-        parameters = {"model_run_id": model_run_id, "top_n": top_n, "cost_bps": cost_bps, "frequency": "monthly", "benchmark": "000300.SH", "factor_model_version": "pit_v1.0", "template_id": template_id, "experiment_name": experiment_name or "未命名实验", "start_date": start_date, "end_date": end_date}
+        parameters = {"model_run_id": model_run_id, "top_n": top_n, "cost_bps": cost_bps, "frequency": "monthly", "benchmark": "000300.SH", "factor_model_version": FACTOR_MODEL_VERSION, "template_id": template_id, "experiment_name": experiment_name or "未命名实验", "start_date": start_date, "end_date": end_date}
         return store.record_run("backtest", status, sanitize_for_storage(parameters), sanitize_for_storage(output), error=sanitize_sensitive_text(result.status_reason))
     except Exception as exc:
         return store.record_run("backtest", "failed", sanitize_for_storage({"model_run_id": model_run_id, "top_n": top_n, "cost_bps": cost_bps}), error=sanitize_sensitive_text(str(exc)))
@@ -1132,7 +1132,7 @@ def run_factor_backtest_run(
     progress=None,
 ) -> str:
     """Build/reuse monthly PIT snapshots and run the independent FACTOR path."""
-    parameters = {"strategy_type": "FACTOR", "top_n": top_n, "cost_bps": cost_bps, "frequency": "monthly", "benchmark": "000300.SH", "factor_version": "pit_v1.0", "pit_version": "pit_v1.0", "template_id": template_id, "experiment_name": experiment_name or "未命名实验", "start_date": start_date, "end_date": end_date}
+    parameters = {"strategy_type": "FACTOR", "top_n": top_n, "cost_bps": cost_bps, "frequency": "monthly", "benchmark": "000300.SH", "factor_version": FACTOR_MODEL_VERSION, "pit_version": PIT_DATA_VERSION, "template_id": template_id, "experiment_name": experiment_name or "未命名实验", "start_date": start_date, "end_date": end_date}
     try:
         memory = store.load_memory() if hasattr(store, "load_memory") else store
         dates = _monthly_rebalance_dates(memory, start_date, end_date)
@@ -1140,10 +1140,10 @@ def run_factor_backtest_run(
         total = len(dates)
         for current, day in enumerate(dates, 1):
             universe_version = _historical_universe_version(memory, day)
-            existing = store.get_factor_snapshot(day, "pit_v1.0", "pit_v1.0", universe_version)
+            existing = store.get_factor_snapshot(day, FACTOR_MODEL_VERSION, PIT_DATA_VERSION, universe_version)
             if progress:
                 progress({"event": "snapshot_check", "current": current, "total": total, "date": day, "status": "reused" if existing else "missing"})
-            snapshot = ensure_factor_snapshot(store, day, factor_version="pit_v1.0", pit_version="pit_v1.0", universe_version=universe_version, memory=memory)
+            snapshot = ensure_factor_snapshot(store, day, factor_version=FACTOR_MODEL_VERSION, pit_version=PIT_DATA_VERSION, universe_version=universe_version, memory=memory)
             if snapshot.get("status") != "completed":
                 event = {"event": "snapshot_failed", "current": current, "total": total, "date": day, "reason": "PIT 因子快照未生成可用项目"}
                 snapshot_events.append(event)
