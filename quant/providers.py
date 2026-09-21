@@ -8,7 +8,7 @@ import time
 
 import requests
 
-from .types import BenchmarkBar, FinancialRecord, IndustryRecord, PriceBar, RawRecord, Security, SecurityStatusRecord, ValuationBar
+from .types import BenchmarkBar, FinancialRecord, IndustryRecord, PriceBar, PriceLimitRecord, RawRecord, Security, SecurityStatusRecord, TradingSuspensionRecord, ValuationBar
 
 
 class DataProvider(ABC):
@@ -89,6 +89,8 @@ class TushareProvider(DataProvider):
         self._last_request_at: float | None = None
         self._raw_financial_records: dict[str, list[RawRecord]] = {}
         self._raw_market_records: dict[str, list[RawRecord]] = {}
+        self._price_limit_records: dict[str, list[PriceLimitRecord]] = {}
+        self._suspension_records: dict[str, list[TradingSuspensionRecord]] = {}
         self._raw_base_records: list[RawRecord] = []
         self._reference_records: list[RawRecord] | None = None
         self.errors: list[dict[str, str]] = []
@@ -191,6 +193,18 @@ class TushareProvider(DataProvider):
     def raw_market_records_for(self, code: str) -> list[RawRecord]:
         return list(self._raw_market_records.get(code, ()))
 
+    def price_limit_records_for(self, code: str) -> list[PriceLimitRecord]:
+        return list(self._price_limit_records.get(code, ()))
+
+    def suspension_records_for(self, code: str) -> list[TradingSuspensionRecord]:
+        return list(self._suspension_records.get(code, ()))
+
+    def all_price_limit_records(self) -> list[PriceLimitRecord]:
+        return [row for rows in self._price_limit_records.values() for row in rows]
+
+    def all_suspension_records(self) -> list[TradingSuspensionRecord]:
+        return [row for rows in self._suspension_records.values() for row in rows]
+
     def raw_base_records(self) -> list[RawRecord]:
         return list(self._raw_base_records)
 
@@ -276,14 +290,77 @@ class TushareProvider(DataProvider):
                 self._progress("行情与复权", index, len(codes), f"{code}：失败（{exc}）")
                 continue
             factor_map = {(r.ts_code, r.trade_date): float(r.adj_factor) for r in factor_rows}
+            limit_rows, suspension_rows = [], []
+            if hasattr(self.pro, "stk_limit"):
+                try:
+                    limit_rows = list(self._request("stk_limit", ts_code=code, start_date=start, end_date=end).itertuples())
+                except Exception as exc:
+                    self._record_error("price_limits", code, exc)
+            if hasattr(self.pro, "suspend_d"):
+                try:
+                    suspension_rows = list(self._request("suspend_d", ts_code=code, start_date=start, end_date=end).itertuples())
+                except Exception as exc:
+                    self._record_error("trading_suspensions", code, exc)
+
+            def optional_float(value):
+                try:
+                    return float(value) if value is not None and isfinite(float(value)) else None
+                except (TypeError, ValueError):
+                    return None
+
+            self._price_limit_records[code] = [
+                PriceLimitRecord(
+                    code,
+                    self._parse_source_date(getattr(row, "trade_date", None)),
+                    optional_float(getattr(row, "up_limit", None)),
+                    optional_float(getattr(row, "down_limit", None)),
+                )
+                for row in limit_rows
+                if self._parse_source_date(getattr(row, "trade_date", None)) is not None
+            ]
+            self._suspension_records[code] = [
+                TradingSuspensionRecord(
+                    code,
+                    self._parse_source_date(getattr(row, "suspend_date", None)),
+                    self._parse_source_date(getattr(row, "resume_date", None)),
+                    getattr(row, "suspend_reason", None) or getattr(row, "reason", None),
+                )
+                for row in suspension_rows
+                if self._parse_source_date(getattr(row, "suspend_date", None)) is not None
+            ]
+            limit_map = {row.trade_date: row for row in self._price_limit_records[code]}
             self._raw_market_records[code] = [
                 RawRecord("daily", code, self._source_payload(row), report_period=self._parse_source_date(getattr(row, "trade_date", None)))
                 for row in daily_rows
             ] + [
                 RawRecord("adj_factor", code, self._source_payload(row), report_period=self._parse_source_date(getattr(row, "trade_date", None)))
                 for row in factor_rows
+            ] + [
+                RawRecord("stk_limit", code, self._source_payload(row), report_period=self._parse_source_date(getattr(row, "trade_date", None)))
+                for row in limit_rows
+            ] + [
+                RawRecord("suspend_d", code, self._source_payload(row), report_period=self._parse_source_date(getattr(row, "suspend_date", None)))
+                for row in suspension_rows
             ]
-            batch = [PriceBar(r.ts_code, date.fromisoformat(f"{r.trade_date[:4]}-{r.trade_date[4:6]}-{r.trade_date[6:]}"), float(r.close), factor_map.get((r.ts_code, r.trade_date), 1.0), volume=float(getattr(r, "vol", 0.0)), open=float(r.open), high=float(r.high), low=float(r.low)) for r in daily_rows]
+            batch = []
+            for r in daily_rows:
+                trade_day = date.fromisoformat(f"{r.trade_date[:4]}-{r.trade_date[4:6]}-{r.trade_date[6:]}")
+                open_price = float(r.open)
+                limit = limit_map.get(trade_day)
+                batch.append(
+                    PriceBar(
+                        r.ts_code,
+                        trade_day,
+                        float(r.close),
+                        factor_map.get((r.ts_code, r.trade_date), 1.0),
+                        limit_up=bool(limit and limit.up_limit is not None and open_price >= float(limit.up_limit) - 1e-9),
+                        limit_down=bool(limit and limit.down_limit is not None and open_price <= float(limit.down_limit) + 1e-9),
+                        volume=float(getattr(r, "vol", 0.0)),
+                        open=open_price,
+                        high=float(r.high),
+                        low=float(r.low),
+                    )
+                )
             self._progress("行情与复权", index, len(codes), f"{code}：完成（{len(batch)} 条）")
             yield code, batch
 

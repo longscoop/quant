@@ -175,11 +175,15 @@ class CnTradabilityProvider(TradabilityProvider):
         normalized_side = side.upper()
         if normalized_side not in {"BUY", "SELL"}:
             raise ValueError(f"unsupported order side: {side}")
+        if hasattr(self.store, "tradability_fact"):
+            fact = self.store.tradability_fact(instrument, day, min_listing_days=self.min_listing_days)
+            reason = fact.buy_reason if normalized_side == "BUY" else fact.sell_reason
+            return TradabilityStatus(reason is None, reason)
+
         security = self.store.securities.get(instrument)
         if security is None:
             return TradabilityStatus(False, "unknown_security")
-        status = self.store.security_status_for(instrument, day) if hasattr(self.store, "security_status_for") else None
-        if status.is_st if status is not None else security.is_st:
+        if security.is_st:
             return TradabilityStatus(False, "st")
         if (day - security.list_date).days < self.min_listing_days:
             return TradabilityStatus(False, "new_listing")

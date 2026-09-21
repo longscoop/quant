@@ -10,7 +10,7 @@ from math import isfinite
 import re
 from uuid import uuid4
 from .providers import DataProvider
-from .types import AuditRun, BenchmarkBar, FinancialRecord, IndustryRecord, PriceBar, RawRecord, Security, SecurityStatusRecord, ValuationBar
+from .types import AuditRun, BenchmarkBar, FinancialRecord, IndustryRecord, PriceBar, PriceLimitRecord, RawRecord, Security, SecurityStatusRecord, TradabilityFact, TradingSuspensionRecord, ValuationBar
 
 
 _REDACTED = "[已隐藏]"
@@ -144,6 +144,8 @@ class InMemoryStore:
         self.index_members: dict[tuple[str, str, object], tuple[str, str, object]] = {}
         self.benchmarks: dict[tuple[str, object], BenchmarkBar] = {}
         self.valuations: dict[tuple[str, object], ValuationBar] = {}
+        self.price_limits: dict[tuple[str, object], PriceLimitRecord] = {}
+        self.trading_suspensions: dict[tuple[str, object], TradingSuspensionRecord] = {}
         self.audit: list[AuditRun] = []
         self.portfolio_positions: dict[tuple[str, str], dict] = {}
         self.factor_snapshots: dict[tuple[object, str, str, str, str | None, str | None, str | None, str | None], dict] = {}
@@ -172,6 +174,16 @@ class InMemoryStore:
             for row in rows:
                 self.valuations[(row.ts_code, row.trade_date)] = row
             self.audit.append(AuditRun("valuations", provider.__class__.__name__, "success", len(rows)))
+        if hasattr(provider, "all_price_limit_records"):
+            rows = provider.all_price_limit_records()
+            for row in rows:
+                self.price_limits[(row.ts_code, row.trade_date)] = row
+            self.audit.append(AuditRun("price_limits", provider.__class__.__name__, "success", len(rows)))
+        if hasattr(provider, "all_suspension_records"):
+            rows = provider.all_suspension_records()
+            for row in rows:
+                self.trading_suspensions[(row.ts_code, row.suspend_date)] = row
+            self.audit.append(AuditRun("trading_suspensions", provider.__class__.__name__, "success", len(rows)))
         if hasattr(provider, "fetch_benchmark"):
             rows = provider.fetch_benchmark()
             for row in rows:
@@ -235,6 +247,71 @@ class InMemoryStore:
             None,
             is_st=security.is_st,
             status_name="ST" if security.is_st else "NORMAL",
+        )
+
+    def price_limit_for(self, code: str, day):
+        return self.price_limits.get((code, day))
+
+    def suspension_for(self, code: str, day):
+        records = [
+            record
+            for (record_code, _), record in self.trading_suspensions.items()
+            if record_code == code
+            and record.suspend_date <= day
+            and (record.resume_date is None or day < record.resume_date)
+        ]
+        return max(records, key=lambda record: record.suspend_date) if records else None
+
+    def tradability_fact(self, code: str, day, *, min_listing_days: int = 180) -> TradabilityFact:
+        security = self.securities.get(code)
+        if security is None:
+            return TradabilityFact(code, day, 0, False, False, False, False, False, False, False, False, "unknown_security", "unknown_security")
+        listing_days = (day - security.list_date).days
+        status = self.security_status_for(code, day)
+        is_st = bool(status.is_st if status is not None else security.is_st)
+        bar = self.prices.get((code, day))
+        has_price = bar is not None
+        has_open = bool(bar is not None and bar.open is not None)
+        suspension = self.suspension_for(code, day)
+        suspended = bool((bar.suspended if bar is not None else False) or suspension is not None)
+        limit = self.price_limit_for(code, day)
+        execution_price = float(bar.open) if bar is not None and bar.open is not None else None
+        limit_up = bool(bar.limit_up if bar is not None else False)
+        limit_down = bool(bar.limit_down if bar is not None else False)
+        if execution_price is not None and limit is not None:
+            if limit.up_limit is not None:
+                limit_up = limit_up or execution_price >= float(limit.up_limit) - 1e-9
+            if limit.down_limit is not None:
+                limit_down = limit_down or execution_price <= float(limit.down_limit) + 1e-9
+
+        common_reason = None
+        if is_st:
+            common_reason = "st"
+        elif listing_days < min_listing_days:
+            common_reason = "new_listing"
+        elif not has_price:
+            common_reason = "missing_price"
+        elif not has_open:
+            common_reason = "missing_open"
+        elif suspended:
+            common_reason = "suspended"
+
+        buy_reason = common_reason or ("limit_up" if limit_up else None)
+        sell_reason = common_reason or ("limit_down" if limit_down else None)
+        return TradabilityFact(
+            code,
+            day,
+            listing_days,
+            is_st,
+            has_price,
+            has_open,
+            suspended,
+            limit_up,
+            limit_down,
+            buy_reason is None,
+            sell_reason is None,
+            buy_reason,
+            sell_reason,
         )
 
     def sync_index_members(self, index_code: str, members: list[tuple[str, object]]) -> None:
@@ -709,6 +786,18 @@ class PostgresStore:
                         conn.execute(price_sql, (r.ts_code, r.trade_date, r.close, r.adj_factor, r.suspended, r.limit_up, r.limit_down, r.volume, r.open, r.high, r.low))
                     if hasattr(provider, "raw_market_records_for"):
                         self._persist_raw_records(conn, provider.raw_market_records_for(code))
+                    if hasattr(provider, "price_limit_records_for"):
+                        for record in provider.price_limit_records_for(code):
+                            conn.execute(
+                                "INSERT INTO price_limits (ts_code,trade_date,up_limit,down_limit) VALUES (%s,%s,%s,%s) ON CONFLICT (ts_code,trade_date) DO UPDATE SET up_limit=EXCLUDED.up_limit,down_limit=EXCLUDED.down_limit",
+                                (record.ts_code, record.trade_date, record.up_limit, record.down_limit),
+                            )
+                    if hasattr(provider, "suspension_records_for"):
+                        for record in provider.suspension_records_for(code):
+                            conn.execute(
+                                "INSERT INTO trading_suspensions (ts_code,suspend_date,resume_date,reason) VALUES (%s,%s,%s,%s) ON CONFLICT (ts_code,suspend_date) DO UPDATE SET resume_date=EXCLUDED.resume_date,reason=EXCLUDED.reason",
+                                (record.ts_code, record.suspend_date, record.resume_date, record.reason),
+                            )
                     self._record_sync_checkpoint(conn, sync_key, "prices", code)
                     conn.commit()
             else:
@@ -778,6 +867,10 @@ class PostgresStore:
                 record = BenchmarkBar(*row); store.benchmarks[(record.ts_code, record.trade_date)] = record
             for row in conn.execute("SELECT ts_code,trade_date,pe_ttm,pb,ps_ttm,dividend_yield,turnover_rate,data_version FROM valuation_bars"):
                 record = ValuationBar(*row); store.valuations[(record.ts_code, record.trade_date)] = record
+            for row in conn.execute("SELECT ts_code,trade_date,up_limit,down_limit FROM price_limits"):
+                record = PriceLimitRecord(*row); store.price_limits[(record.ts_code, record.trade_date)] = record
+            for row in conn.execute("SELECT ts_code,suspend_date,resume_date,reason FROM trading_suspensions"):
+                record = TradingSuspensionRecord(*row); store.trading_suspensions[(record.ts_code, record.suspend_date)] = record
             for row in conn.execute("SELECT dataset,source,status,row_count,created_at,error FROM ingestion_audit ORDER BY created_at"):
                 store.audit.append(AuditRun(*row))
         return store

@@ -103,6 +103,39 @@ class ValuationBar:
 
 
 @dataclass(frozen=True)
+class PriceLimitRecord:
+    ts_code: str
+    trade_date: date
+    up_limit: float | None = None
+    down_limit: float | None = None
+
+
+@dataclass(frozen=True)
+class TradingSuspensionRecord:
+    ts_code: str
+    suspend_date: date
+    resume_date: date | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class TradabilityFact:
+    ts_code: str
+    trade_date: date
+    listing_days: int
+    is_st: bool
+    has_price: bool
+    has_open: bool
+    suspended: bool
+    limit_up: bool
+    limit_down: bool
+    tradable_buy: bool
+    tradable_sell: bool
+    buy_reason: str | None = None
+    sell_reason: str | None = None
+
+
+@dataclass(frozen=True)
 class PITContext:
     as_of_date: date
     tradable_date: date | None
