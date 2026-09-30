@@ -91,6 +91,7 @@ class TushareProvider(DataProvider):
         self._raw_market_records: dict[str, list[RawRecord]] = {}
         self._price_limit_records: dict[str, list[PriceLimitRecord]] = {}
         self._suspension_records: dict[str, list[TradingSuspensionRecord]] = {}
+        self._suspension_resume_dates: dict[str, list[date]] = {}
         self._raw_base_records: list[RawRecord] = []
         self._reference_records: list[RawRecord] | None = None
         self.errors: list[dict[str, str]] = []
@@ -199,6 +200,58 @@ class TushareProvider(DataProvider):
     def suspension_records_for(self, code: str) -> list[TradingSuspensionRecord]:
         return list(self._suspension_records.get(code, ()))
 
+    def suspension_resume_dates_for(self, code: str) -> list[date]:
+        return list(self._suspension_resume_dates.get(code, ()))
+
+    def _parse_suspension_events(self, code: str, rows) -> tuple[list[TradingSuspensionRecord], list[date], list[RawRecord]]:
+        """Turn Tushare's daily S rows and R event into actual suspension periods."""
+        events = []
+        raw = []
+        for row in rows:
+            day = self._parse_source_date(getattr(row, "trade_date", None))
+            if day is None:
+                continue
+            raw.append(RawRecord("suspend_d", code, self._source_payload(row), report_period=day))
+            kind = getattr(row, "suspend_type", None)
+            if kind in {"S", "R"}:
+                events.append((day, kind, getattr(row, "suspend_timing", None)))
+        records: list[TradingSuspensionRecord] = []
+        resume_dates: list[date] = []
+        start: date | None = None
+        # A source day can contain both R and S.  Close the old period first;
+        # the same day's full-day S observation then starts the new period.
+        for day, kind, timing in sorted(events, key=lambda event: (event[0], event[1] == "S")):
+            full_day = timing is None or str(timing).strip().lower() in {"", "nan", "none", "nat"}
+            if kind == "S" and full_day and start is None:
+                start = day
+            elif kind == "R":
+                resume_dates.append(day)
+                if start is not None:
+                    records.append(TradingSuspensionRecord(code, start, day))
+                    start = None
+        if start is not None:
+            records.append(TradingSuspensionRecord(code, start))
+        return records, resume_dates, raw
+
+    def iter_suspension_batches(self, skip_codes=None):
+        """Fetch suspension events alone, for historical repair without replaying prices."""
+        start, end = self.start_date.strftime("%Y%m%d"), self.end_date.strftime("%Y%m%d")
+        codes = self._codes()
+        skip_codes = set(skip_codes or ())
+        for index, code in enumerate(codes, 1):
+            if code in skip_codes:
+                self._progress("停复牌", index, len(codes), f"{code}：已入库，跳过")
+                continue
+            try:
+                frame = self._request("suspend_d", ts_code=code, start_date=start, end_date=end)
+                records, resume_dates, raw = self._parse_suspension_events(code, frame.itertuples())
+            except Exception as exc:
+                self._record_error("trading_suspensions", code, exc)
+                self._progress("停复牌", index, len(codes), f"{code}：失败")
+                continue
+            self._progress("停复牌", index, len(codes), f"{code}：完成（{len(raw)} 条）")
+            yield code, records, resume_dates, raw
+
     def all_price_limit_records(self) -> list[PriceLimitRecord]:
         return [row for rows in self._price_limit_records.values() for row in rows]
 
@@ -289,7 +342,19 @@ class TushareProvider(DataProvider):
                 self._record_error("market", code, exc)
                 self._progress("行情与复权", index, len(codes), f"{code}：失败（{exc}）")
                 continue
-            factor_map = {(r.ts_code, r.trade_date): float(r.adj_factor) for r in factor_rows}
+            factor_map = {}
+            for row in factor_rows:
+                try:
+                    factor = float(row.adj_factor)
+                except (TypeError, ValueError):
+                    continue
+                if isfinite(factor) and factor > 0:
+                    factor_map[(row.ts_code, row.trade_date)] = factor
+            missing_factors = [r.trade_date for r in daily_rows if (r.ts_code, r.trade_date) not in factor_map]
+            if missing_factors:
+                self._record_error("adj_factor", code, ValueError(f"{code} 有 {len(missing_factors)} 个行情日缺少复权因子"))
+                self._progress("行情与复权", index, len(codes), f"{code}：缺少复权因子，未写入行情")
+                continue
             limit_rows, suspension_rows = [], []
             if hasattr(self.pro, "stk_limit"):
                 try:
@@ -318,16 +383,9 @@ class TushareProvider(DataProvider):
                 for row in limit_rows
                 if self._parse_source_date(getattr(row, "trade_date", None)) is not None
             ]
-            self._suspension_records[code] = [
-                TradingSuspensionRecord(
-                    code,
-                    self._parse_source_date(getattr(row, "suspend_date", None)),
-                    self._parse_source_date(getattr(row, "resume_date", None)),
-                    getattr(row, "suspend_reason", None) or getattr(row, "reason", None),
-                )
-                for row in suspension_rows
-                if self._parse_source_date(getattr(row, "suspend_date", None)) is not None
-            ]
+            suspension_records, resume_dates, raw_suspensions = self._parse_suspension_events(code, suspension_rows)
+            self._suspension_records[code] = suspension_records
+            self._suspension_resume_dates[code] = resume_dates
             limit_map = {row.trade_date: row for row in self._price_limit_records[code]}
             self._raw_market_records[code] = [
                 RawRecord("daily", code, self._source_payload(row), report_period=self._parse_source_date(getattr(row, "trade_date", None)))
@@ -338,10 +396,7 @@ class TushareProvider(DataProvider):
             ] + [
                 RawRecord("stk_limit", code, self._source_payload(row), report_period=self._parse_source_date(getattr(row, "trade_date", None)))
                 for row in limit_rows
-            ] + [
-                RawRecord("suspend_d", code, self._source_payload(row), report_period=self._parse_source_date(getattr(row, "suspend_date", None)))
-                for row in suspension_rows
-            ]
+            ] + raw_suspensions
             batch = []
             for r in daily_rows:
                 trade_day = date.fromisoformat(f"{r.trade_date[:4]}-{r.trade_date[4:6]}-{r.trade_date[6:]}")
@@ -352,7 +407,7 @@ class TushareProvider(DataProvider):
                         r.ts_code,
                         trade_day,
                         float(r.close),
-                        factor_map.get((r.ts_code, r.trade_date), 1.0),
+                        factor_map[(r.ts_code, r.trade_date)],
                         limit_up=bool(limit and limit.up_limit is not None and open_price >= float(limit.up_limit) - 1e-9),
                         limit_down=bool(limit and limit.down_limit is not None and open_price <= float(limit.down_limit) + 1e-9),
                         volume=float(getattr(r, "vol", 0.0)),

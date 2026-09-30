@@ -179,11 +179,11 @@ def _metrics(memory, codes, as_of, benchmark_id):
     return raw
 
 
-def build_rankings(memory, as_of: date, template_id: str = "quality_growth", *, context=None, universe_provider=None) -> list[dict]:
+def build_rankings(memory, as_of: date, template_id: str = "quality_growth", *, context=None, universe_provider=None, universe: list[str] | None = None) -> list[dict]:
     """Build serializable v1 research rankings for a point-in-time strategy pool."""
     strategy = template(template_id)
     from .pit import PITRepository
-    snapshot = PITRepository(memory, context=context, universe_provider=universe_provider).snapshot(as_of)
+    snapshot = PITRepository(memory, context=context, universe_provider=universe_provider).snapshot(as_of, universe=universe)
     codes = [security.ts_code for security in snapshot.universe]
     benchmark_id = context.benchmark_id if context is not None else "000300.SH"
     raw = _metrics(memory, codes, as_of, benchmark_id)
@@ -240,6 +240,7 @@ def build_rankings(memory, as_of: date, template_id: str = "quality_growth", *, 
                 )
             else:
                 percentiles[code][metric] = universe.get(code)
+    next_day = next_trading_day(as_of, sorted({bar.trade_date for bar in memory.prices.values()}))
     result = []
     for code in codes:
         factors = {
@@ -251,5 +252,5 @@ def build_rankings(memory, as_of: date, template_id: str = "quality_growth", *, 
             for name, metrics in FACTOR_METRIC_GROUPS.items()
         }
         composite = composite_score(factors, strategy.weights)
-        result.append({"ts_code": code, "as_of_date": as_of.isoformat(), "tradable_date": next_trading_day(as_of, sorted({bar.trade_date for bar in memory.prices.values()})).isoformat() if next_trading_day(as_of, sorted({bar.trade_date for bar in memory.prices.values()})) else None, "factor_model_version": FACTOR_MODEL_VERSION, "strategy_template_id": strategy.template_id, "factors": {name: score.to_dict() for name, score in factors.items()}, "score": composite.to_dict(), "metrics": percentiles[code]})
+        result.append({"ts_code": code, "as_of_date": as_of.isoformat(), "tradable_date": next_day.isoformat() if next_day else None, "factor_model_version": FACTOR_MODEL_VERSION, "strategy_template_id": strategy.template_id, "factors": {name: score.to_dict() for name, score in factors.items()}, "score": composite.to_dict(), "metrics": percentiles[code]})
     return sorted(result, key=lambda row: row["score"]["score"] if row["score"]["score"] is not None else -1, reverse=True)

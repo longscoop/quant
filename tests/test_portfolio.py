@@ -189,7 +189,26 @@ class PortfolioWorkflowTests(unittest.TestCase):
 
         self.assertEqual(order["status"], "PENDING")
         self.assertIn("开盘价", order["reason"])
+        self.assertIsNone(order["target_quantity"])
+        self.assertIsNone(order["remaining_quantity"])
         self.assertEqual(self.store.list_portfolio_trades(self.portfolio_id), [])
+
+    def test_missing_open_keeps_existing_sell_intent(self):
+        """Would fail if an unknown execution quantity turned a pending reduction into a buy."""
+        save_portfolio_targets(self.store, self.portfolio_id, {"000001.SZ": 0.5})
+        self._add_next_bar(open_price=15.0)
+        reconcile_portfolio_orders(self.store, self.portfolio_id)
+        revision_id = save_portfolio_targets(self.store, self.portfolio_id, {"000001.SZ": 0.2})
+        self.store.prices[("000001.SZ", date(2024, 6, 18))] = PriceBar(
+            "000001.SZ", date(2024, 6, 18), close=15.0, open=None
+        )
+
+        reconcile_portfolio_orders(self.store, self.portfolio_id)
+        order = self.store.list_portfolio_orders(self.portfolio_id, revision_id)[0]
+
+        self.assertEqual(order["status"], "PENDING")
+        self.assertEqual(order["side"], "SELL")
+        self.assertIsNone(order["target_quantity"])
 
     def test_confirmed_suspension_is_failed_instead_of_pending_forever(self):
         revision_id = save_portfolio_targets(self.store, self.portfolio_id, {"000001.SZ": 0.5})

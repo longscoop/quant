@@ -1,0 +1,35 @@
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, expect, it, vi } from "vitest";
+import { StockSearch } from "./StockSearch";
+import { AddToPortfolio } from "./AddToPortfolio";
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.useRealTimers(); });
+const json = (body: unknown) => new Response(JSON.stringify(body));
+it("searches only after input and ignores responses for superseded searches", async () => {
+  vi.useFakeTimers();
+  let old!: (response: Response) => void;
+  const fetchMock = vi.fn().mockImplementation((url: string) => url.includes("query=000") ? new Promise<Response>((resolve) => { old = resolve; }) : Promise.resolve(json({ stocks: [{ code: "600000.SH", name: "浦发银行" }] })));
+  vi.stubGlobal("fetch", fetchMock);
+  const select = vi.fn(); render(<StockSearch onSelect={select} />);
+  expect(fetchMock).not.toHaveBeenCalled();
+  fireEvent.change(screen.getByRole("combobox"), { target: { value: "000" } });
+  await act(() => vi.advanceTimersByTimeAsync(260));
+  fireEvent.change(screen.getByRole("combobox"), { target: { value: "600" } });
+  await act(() => vi.advanceTimersByTimeAsync(260));
+  await act(async () => { old(json({ stocks: [{ code: "000001.SZ", name: "平安银行" }] })); });
+  expect(screen.queryByText("平安银行")).not.toBeInTheDocument();
+  fireEvent.keyDown(screen.getByRole("combobox"), { key: "ArrowDown" });
+  fireEvent.keyDown(screen.getByRole("combobox"), { key: "Enter" });
+  expect(select).toHaveBeenCalledWith({ code: "600000.SH", name: "浦发银行" });
+});
+it("requires an explicit portfolio choice and links completed additions to its pending list", async () => {
+  HTMLDialogElement.prototype.showModal = function () { this.setAttribute("open", ""); };
+  const fetchMock = vi.fn().mockImplementation((_url: string, options: RequestInit) => Promise.resolve(json(options.method === "POST" ? { status: "DRAFT_ADDED" } : { portfolios: [{ portfolio_id: "one", name: "组合一", status: "ACTIVE" }, { portfolio_id: "two", name: "组合二", status: "ACTIVE" }] })));
+  vi.stubGlobal("fetch", fetchMock);
+  render(<AddToPortfolio codes={["000001.SZ", "600000.SH"]} onClose={() => {}} />);
+  await screen.findByLabelText("组合二");
+  expect(screen.getByRole("button", { name: "添加到待调整清单" })).toBeDisabled();
+  fireEvent.click(screen.getByLabelText("组合二"));
+  fireEvent.click(screen.getByRole("button", { name: "添加到待调整清单" }));
+  expect(await screen.findByRole("link", { name: "查看待调整清单 →" })).toHaveAttribute("href", "/portfolios/two?tab=targets");
+  expect(fetchMock.mock.calls.filter(([, options]) => options.method === "POST").map(([url]) => url)).toEqual(["/api/v1/portfolios/two/draft-securities", "/api/v1/portfolios/two/draft-securities"]);
+});

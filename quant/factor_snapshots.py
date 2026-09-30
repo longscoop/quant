@@ -26,6 +26,7 @@ def ensure_factor_snapshot(
     pit_version: str = PIT_DATA_VERSION,
     universe_version: str = "hs300:all",
     memory=None,
+    universe_codes: list[str] | None = None,
     context: ResearchContext | None = None,
     market_config: MarketConfig | None = None,
 ) -> dict:
@@ -46,8 +47,8 @@ def ensure_factor_snapshot(
             pit_snapshot = PITRepository(memory, context=context, universe_provider=universe_provider).snapshot(as_of_date)
             rankings = build_rankings(memory, as_of_date, context=context, universe_provider=universe_provider)
         else:
-            pit_snapshot = PITRepository(memory).snapshot(as_of_date)
-            rankings = build_rankings(memory, as_of_date)
+            pit_snapshot = PITRepository(memory).snapshot(as_of_date, universe=universe_codes)
+            rankings = build_rankings(memory, as_of_date, universe=universe_codes)
         items = []
         for ranking in rankings:
             factor_rows = ranking.get("factors") or {}

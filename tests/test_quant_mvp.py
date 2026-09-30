@@ -106,6 +106,54 @@ class QuantMvpTests(unittest.TestCase):
         result = run_backtest(BacktestConfig(top_n=2), prediction, PITRepository(self.store))
         self.assertEqual(result.status_reason, "缺少共同持有期终止日")
 
+    def test_factor_rebalance_schedule_excludes_terminal_signal_and_keeps_month_boundaries(self):
+        from quant.types import BenchmarkBar, FinancialRecord, PriceBar, Security, TradingSuspensionRecord
+
+        store = InMemoryStore()
+        code = "000001.SZ"
+        store.securities[code] = Security(code, "Alpha", date(2020, 1, 1))
+        financial = FinancialRecord(code, date(2023, 12, 31), date(2024, 1, 15), 100.0, 10.0, .1, .2, 12.0, .4)
+        store.financials[(code, financial.report_period, financial.ann_date)] = financial
+        schedule = [date(2024, 1, 31), date(2024, 2, 29), date(2024, 3, 29)]
+        trading_days = schedule + [date(2024, 2, 1), date(2024, 2, 15), date(2024, 3, 1), date(2024, 3, 15), date(2024, 4, 1), date(2024, 4, 15)]
+        for day in trading_days:
+            store.prices[(code, day)] = PriceBar(code, day, 10.0, open=10.0)
+            store.benchmarks[("000300.SH", day)] = BenchmarkBar("000300.SH", day, 4000.0, 4000.0)
+        prediction = PredictionSnapshot([PredictionRow(day, code, 1.0) for day in schedule], {})
+
+        result = run_backtest(BacktestConfig(top_n=1), prediction, PITRepository(store), rebalance_schedule=schedule)
+
+        self.assertEqual([day for day, _ in result.equity_curve], [day for day in sorted(trading_days) if date(2024, 2, 1) <= day <= schedule[-1]])
+        self.assertEqual(result.completed_periods, 2)
+        self.assertEqual([trade["execution_date"] for trade in result.trades], [date(2024, 2, 1)])
+
+        missing_middle = PredictionSnapshot([PredictionRow(schedule[0], code, 1.0)], {})
+        partial = run_backtest(BacktestConfig(top_n=1), missing_middle, PITRepository(store), rebalance_schedule=schedule, skip_invalid_periods=True)
+        self.assertEqual([day for day, _ in partial.equity_curve], [date(2024, 2, 1), date(2024, 2, 15), schedule[1]])
+        self.assertEqual(partial.completed_periods, 1)
+        self.assertEqual([item["date"] for item in partial.skipped_periods], [schedule[1]])
+
+        first_execution = date(2024, 2, 1)
+        saved_entry = store.prices.pop((code, first_execution))
+        missing_entry = run_backtest(BacktestConfig(top_n=1), prediction, PITRepository(store), rebalance_schedule=schedule, skip_invalid_periods=True)
+        self.assertEqual([item["date"] for item in missing_entry.skipped_periods], [schedule[0]])
+        strict_missing = run_backtest(BacktestConfig(top_n=1), prediction, PITRepository(store), rebalance_schedule=schedule)
+        self.assertEqual(strict_missing.metrics, {})
+        self.assertEqual(strict_missing.equity_curve, [])
+        self.assertIn("开盘行情缺失", strict_missing.status_reason)
+        store.prices[(code, first_execution)] = saved_entry
+
+        saved_exit = store.prices.pop((code, schedule[1]))
+        store.trading_suspensions[(code, schedule[1])] = TradingSuspensionRecord(code, schedule[1], schedule[2])
+        missing_exit = run_backtest(BacktestConfig(top_n=1), prediction, PITRepository(store), rebalance_schedule=schedule, skip_invalid_periods=True)
+        self.assertEqual([item["date"] for item in missing_exit.skipped_periods], [schedule[1]])
+        self.assertEqual(missing_exit.completed_periods, 1)
+        self.assertEqual(missing_exit.valuation_audit[0]["method"], "last_visible_close_during_suspension")
+        del store.trading_suspensions[(code, schedule[1])]
+        missing_data = run_backtest(BacktestConfig(top_n=1), prediction, PITRepository(store), rebalance_schedule=schedule, skip_invalid_periods=True)
+        self.assertTrue(any("收盘行情缺失且无停牌证据" in item["reason"] for item in missing_data.skipped_periods))
+        store.prices[(code, schedule[1])] = saved_exit
+
     def test_cli_exposes_database_backed_research_stages(self):
         result = subprocess.run([sys.executable, "-m", "quant.cli", "--help"], capture_output=True, text=True, check=True)
         self.assertIn("init-db", result.stdout)

@@ -14,6 +14,7 @@ from .types import AuditRun, BenchmarkBar, FinancialRecord, IndustryRecord, Pric
 
 
 _REDACTED = "[已隐藏]"
+_QUALITY_INDEX_BY_UNIVERSE = {"hs300": "000300.SH"}
 _SENSITIVE_KEY_RE = re.compile(
     r"(?:^|_)(?:tushare_)?(?:token|password|secret|dsn|database_url)(?:$|_)",
     re.IGNORECASE,
@@ -38,6 +39,54 @@ def sanitize_sensitive_text(value: str | None) -> str | None:
     text = value
     text = _DATABASE_URL_RE.sub(_REDACTED, text)
     return _SENSITIVE_VALUE_RE.sub(r"\1\2" + _REDACTED, text)
+
+
+def _quality_report(
+    universe: str,
+    latest: date | None,
+    snapshot_date: date | None,
+    member_codes: set[str],
+    master_codes: set[str],
+    priced_codes: set[str],
+    financial_codes: set[str],
+    valued_codes: set[str],
+    valuation_count: int,
+    benchmark_latest: date | None = None,
+    suspended_codes: set[str] | None = None,
+) -> dict:
+    suspended = (member_codes - priced_codes) & (suspended_codes or set())
+    tradable_members = member_codes - suspended
+    missing_master = sorted(member_codes - master_codes)
+    missing_prices = sorted(tradable_members - priced_codes)
+    missing_financials = sorted(member_codes - financial_codes)
+    missing_valuations = sorted(tradable_members - valued_codes)
+    report = {
+        "universe": universe,
+        "security_count": len(member_codes),
+        "historical_security_count": len(master_codes),
+        "universe_snapshot_date": snapshot_date,
+        "latest_trade_date": latest,
+        "latest_benchmark_trade_date": benchmark_latest,
+        "latest_price_coverage": len(member_codes & priced_codes),
+        "suspended_latest_codes": sorted(suspended),
+        "missing_security_codes": missing_master,
+        "missing_latest_price_codes": missing_prices,
+        "missing_financial_codes": missing_financials,
+        "missing_latest_valuation_codes": missing_valuations,
+        "valuation_count": valuation_count,
+    }
+    report["is_complete"] = bool(
+        latest and snapshot_date and member_codes
+        and benchmark_latest is not None and latest >= benchmark_latest
+        and not (missing_master or missing_prices or missing_financials or missing_valuations)
+    )
+    report["status_reason"] = (
+        "missing_historical_snapshot" if snapshot_date is None
+        else "missing_benchmark" if benchmark_latest is None
+        else "price_lags_benchmark" if latest and latest < benchmark_latest
+        else None
+    )
+    return report
 
 
 def _canonical_json_storage_key(key) -> str:
@@ -160,6 +209,7 @@ class InMemoryStore:
         self.market_calendar: dict[tuple[str, object], dict] = {}
 
     def sync(self, provider: DataProvider) -> None:
+        self._read_index_sizes = {}
         datasets = (("securities", provider.fetch_securities(), self.securities, lambda r: r.ts_code), ("prices", provider.fetch_prices(), self.prices, lambda r: (r.ts_code, r.trade_date)), ("financials", provider.fetch_financials(), self.financials, lambda r: (r.ts_code, r.report_period, r.ann_date)), ("industries", provider.fetch_industries(), self.industries, lambda r: (r.ts_code, r.effective_date)))
         for name, rows, target, key in datasets:
             for row in rows:
@@ -203,28 +253,57 @@ class InMemoryStore:
 
     def data_quality(self, universe: str = "hs300") -> dict:
         """Return actionable coverage gaps for a snapshot without mutating it."""
+        index_code = _QUALITY_INDEX_BY_UNIVERSE[universe]
         latest = max((bar.trade_date for bar in self.prices.values()), default=None)
-        codes = sorted(self.securities)
+        snapshot_date = max(
+            (day for index, _, day in self.index_members if index == index_code and latest and day <= latest),
+            default=None,
+        )
+        members = set(self.members_for(index_code, latest)) if snapshot_date is not None else set()
         priced = {code for code, day in self.prices if day == latest} if latest else set()
         financial_codes = {code for code, _, _ in self.financials}
-        missing_prices = sorted(set(codes) - priced) if latest else codes
-        missing_financials = sorted(set(codes) - financial_codes)
-        return {
-            "universe": universe,
-            "security_count": len(codes),
-            "latest_trade_date": latest,
-            "latest_price_coverage": len(priced),
-            "missing_latest_price_codes": missing_prices,
-            "missing_financial_codes": missing_financials,
-            "valuation_count": len(self.valuations),
-            "is_complete": bool(codes and latest and not missing_prices and not missing_financials and self.valuations),
-        }
+        valued = {code for code, day in self.valuations if day == latest} if latest else set()
+        benchmark_latest = max((day for code, day in self.benchmarks if code == index_code), default=None)
+        suspended = {code for code in members if latest is not None and self.suspension_for(code, latest) is not None}
+        return _quality_report(
+            universe, latest, snapshot_date, members, set(self.securities), priced,
+            financial_codes, valued, len(self.valuations), benchmark_latest, suspended,
+        )
 
     def prices_for(self, code: str):
+        if getattr(self, "_read_index_sizes", {}).get("prices") == len(self.prices):
+            return list(self._prices_by_code.get(code, ()))
         return sorted((p for (c, _), p in self.prices.items() if c == code), key=lambda p: p.trade_date)
 
+    def search_securities(self, query: str, limit: int = 20) -> list[dict]:
+        query = query.strip().casefold()
+        return [{"code": code, "name": item.name} for code, item in sorted(self.securities.items())
+                if query in code.casefold() or query in item.name.casefold()][:limit]
+
+    def load_validation_evidence(self, codes: list[str], days: list[date]) -> InMemoryStore:
+        store = InMemoryStore()
+        store.securities = {code: self.securities[code] for code in codes if code in self.securities}
+        store.prices = {(code, day): self.prices[(code, day)] for code in codes for day in days if (code, day) in self.prices}
+        return store
+
     def financials_for(self, code: str):
+        if getattr(self, "_read_index_sizes", {}).get("financials") == len(self.financials):
+            return list(self._financials_by_code.get(code, ()))
         return [f for (c, _, _), f in self.financials.items() if c == code]
+
+    def prepare_read_indexes(self) -> None:
+        """Index a database-loaded research snapshot for repeated PIT lookups."""
+        prices, financials, valuations = defaultdict(list), defaultdict(list), defaultdict(list)
+        for (code, _), row in self.prices.items():
+            prices[code].append(row)
+        for (code, _, _), row in self.financials.items():
+            financials[code].append(row)
+        for (code, _), row in self.valuations.items():
+            valuations[code].append(row)
+        self._prices_by_code = {code: sorted(rows, key=lambda row: row.trade_date) for code, rows in prices.items()}
+        self._financials_by_code = dict(financials)
+        self._valuations_by_code = {code: sorted(rows, key=lambda row: row.trade_date) for code, rows in valuations.items()}
+        self._read_index_sizes = {"prices": len(self.prices), "financials": len(self.financials), "valuations": len(self.valuations)}
 
     def industry_for(self, code: str):
         return [i for (c, _), i in self.industries.items() if c == code]
@@ -329,6 +408,13 @@ class InMemoryStore:
     def index_member_codes(self, index_code: str) -> list[str]:
         return sorted({code for index, code, _ in self.index_members if index == index_code})
 
+    def missing_valuation_days(self, index_code: str, start_date: date, end_date: date) -> list[tuple[str, date]]:
+        codes = set(self.index_member_codes(index_code))
+        return sorted(
+            (code, day) for code, day in self.prices
+            if code in codes and start_date <= day <= end_date and (code, day) not in self.valuations
+        )
+
     def benchmark_for(self, code: str = "000300.SH"):
         return sorted((bar for (c, _), bar in self.benchmarks.items() if c == code), key=lambda bar: bar.trade_date)
 
@@ -350,6 +436,8 @@ class InMemoryStore:
         return sorted(rows, key=lambda row: row["trade_date"])
 
     def valuations_for(self, code: str):
+        if getattr(self, "_read_index_sizes", {}).get("valuations") == len(self.valuations):
+            return list(self._valuations_by_code.get(code, ()))
         return sorted((bar for (c, _), bar in self.valuations.items() if c == code), key=lambda bar: bar.trade_date)
 
     def create_portfolio(self, name: str, initial_capital: float = 1_000_000.0, transaction_cost_bps: float = 5.0, benchmark_code: str = "000300.SH", *, portfolio_id: str | None = None, market_id: str | None = None, currency: str | None = None) -> str:
@@ -623,6 +711,9 @@ class PostgresStore:
         if self._initialized:
             return
         with self._connect() as conn:
+            # Schema DDL takes relation locks in several tables.  Serialize
+            # concurrent process startup so read-only jobs cannot deadlock here.
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext('quant-schema-initialize'))")
             conn.execute(POSTGRES_SCHEMA)
             for column in ("revenue", "net_profit", "roe", "gross_margin", "operating_cashflow", "debt_ratio"):
                 conn.execute(f"ALTER TABLE financials ALTER COLUMN {column} DROP NOT NULL")
@@ -805,9 +896,12 @@ class PostgresStore:
                     if hasattr(provider, "suspension_records_for"):
                         for record in provider.suspension_records_for(code):
                             conn.execute(
-                                "INSERT INTO trading_suspensions (ts_code,suspend_date,resume_date,reason) VALUES (%s,%s,%s,%s) ON CONFLICT (ts_code,suspend_date) DO UPDATE SET resume_date=EXCLUDED.resume_date,reason=EXCLUDED.reason",
+                                "INSERT INTO trading_suspensions (ts_code,suspend_date,resume_date,reason) VALUES (%s,%s,%s,%s) ON CONFLICT (ts_code,suspend_date) DO UPDATE SET resume_date=COALESCE(EXCLUDED.resume_date,trading_suspensions.resume_date),reason=COALESCE(EXCLUDED.reason,trading_suspensions.reason)",
                                 (record.ts_code, record.suspend_date, record.resume_date, record.reason),
                             )
+                    if hasattr(provider, "suspension_resume_dates_for"):
+                        for resumed in provider.suspension_resume_dates_for(code):
+                            self._close_open_suspension(conn, code, resumed)
                     self._record_sync_checkpoint(conn, sync_key, "prices", code)
                     conn.commit()
             else:
@@ -843,6 +937,44 @@ class PostgresStore:
                 conn.commit()
             if hasattr(provider, "fetch_benchmark"):
                 for r in provider.fetch_benchmark(): conn.execute("INSERT INTO benchmark_bars (ts_code,trade_date,close,open) VALUES (%s,%s,%s,%s) ON CONFLICT (ts_code,trade_date) DO UPDATE SET close=EXCLUDED.close,open=EXCLUDED.open", (r.ts_code, r.trade_date, r.close, r.open))
+
+    @staticmethod
+    def _close_open_suspension(conn, code: str, resumed: date) -> None:
+        conn.execute(
+            "UPDATE trading_suspensions SET resume_date=%s WHERE ts_code=%s AND suspend_date=("
+            "SELECT max(suspend_date) FROM trading_suspensions WHERE ts_code=%s "
+            "AND suspend_date<%s AND resume_date IS NULL)",
+            (resumed, code, code, resumed),
+        )
+
+    def sync_suspensions(self, provider, *, sync_key: str) -> None:
+        """Persist real Tushare suspension events with per-code restart checkpoints."""
+        self.initialize()
+        with self._connect() as conn:
+            completed = self._completed_sync_codes(conn, sync_key, "suspensions")
+            for code, records, resume_dates, raw in provider.iter_suspension_batches(skip_codes=completed):
+                existing = conn.execute(
+                    "SELECT count(*) FROM trading_suspensions WHERE ts_code=%s AND suspend_date BETWEEN %s AND %s",
+                    (code, provider.start_date, provider.end_date),
+                ).fetchone()[0]
+                if existing and not raw:
+                    raise ValueError(f"{code} 源接口未返回此前已有的停复牌事件")
+                conn.execute(
+                    "DELETE FROM trading_suspensions WHERE ts_code=%s AND suspend_date BETWEEN %s AND %s",
+                    (code, provider.start_date, provider.end_date),
+                )
+                for record in records:
+                    conn.execute(
+                        "INSERT INTO trading_suspensions (ts_code,suspend_date,resume_date,reason) "
+                        "VALUES (%s,%s,%s,%s) ON CONFLICT (ts_code,suspend_date) "
+                        "DO UPDATE SET resume_date=COALESCE(EXCLUDED.resume_date,trading_suspensions.resume_date),reason=COALESCE(EXCLUDED.reason,trading_suspensions.reason)",
+                        (record.ts_code, record.suspend_date, record.resume_date, record.reason),
+                    )
+                for resumed in resume_dates:
+                    self._close_open_suspension(conn, code, resumed)
+                self._persist_raw_records(conn, raw)
+                self._record_sync_checkpoint(conn, sync_key, "suspensions", code)
+                conn.commit()
 
     def sync_benchmark(self, provider, ts_code: str = "000300.SH") -> int:
         """Replace one benchmark's requested window only when every row has a real open."""
@@ -883,6 +1015,7 @@ class PostgresStore:
                 record = TradingSuspensionRecord(*row); store.trading_suspensions[(record.ts_code, record.suspend_date)] = record
             for row in conn.execute("SELECT dataset,source,status,row_count,created_at,error FROM ingestion_audit ORDER BY created_at"):
                 store.audit.append(AuditRun(*row))
+        store.prepare_read_indexes()
         return store
 
     def upsert_market_calendar_session(self, calendar_id: str, trade_date, is_open: bool, source: str) -> None:
@@ -977,6 +1110,33 @@ class PostgresStore:
                 store.prices[(record.ts_code, record.trade_date)] = record
         return store
 
+    def search_securities(self, query: str, limit: int = 20) -> list[dict]:
+        # Literal substring matching: user-entered SQL wildcards have no special meaning.
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT ts_code,name FROM securities WHERE strpos(lower(ts_code),lower(%s))>0 OR strpos(lower(name),lower(%s))>0 ORDER BY ts_code LIMIT %s",
+                (query.strip(), query.strip(), limit),
+            ).fetchall()
+        return [{"code": row[0], "name": row[1]} for row in rows]
+
+    def load_validation_evidence(self, codes: list[str], days: list[date]) -> InMemoryStore:
+        """Fetch names and exact execution sessions, never the full price history."""
+        store = InMemoryStore()
+        if not codes:
+            return store
+        with self._connect() as conn:
+            for row in conn.execute("SELECT ts_code,name,list_date,is_st FROM securities WHERE ts_code = ANY(%s)", (codes,)):
+                record = Security(*row)
+                store.securities[record.ts_code] = record
+            if days:
+                for row in conn.execute(
+                    "SELECT ts_code,trade_date,close,adj_factor,suspended,limit_up,limit_down,volume,open,high,low FROM price_bars WHERE ts_code = ANY(%s) AND trade_date = ANY(%s)",
+                    (codes, days),
+                ):
+                    record = PriceBar(*row)
+                    store.prices[(record.ts_code, record.trade_date)] = record
+        return store
+
     def sync_index_members(self, index_code: str, members: list[tuple[str, object]]) -> None:
         self.initialize()
         with self._connect() as conn:
@@ -987,6 +1147,66 @@ class PostgresStore:
         self.initialize()
         with self._connect() as conn:
             rows = conn.execute("SELECT DISTINCT ts_code FROM index_members WHERE index_code=%s ORDER BY ts_code", (index_code,)).fetchall()
+        return [row[0] for row in rows]
+
+    def missing_valuation_days(self, index_code: str, start_date: date, end_date: date) -> list[tuple[str, date]]:
+        self.initialize()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT p.ts_code,p.trade_date FROM price_bars p "
+                "JOIN (SELECT DISTINCT ts_code FROM index_members WHERE index_code=%s) m ON m.ts_code=p.ts_code "
+                "LEFT JOIN valuation_bars v ON v.ts_code=p.ts_code AND v.trade_date=p.trade_date "
+                "WHERE p.trade_date BETWEEN %s AND %s AND v.ts_code IS NULL "
+                "ORDER BY p.ts_code,p.trade_date",
+                (index_code, start_date, end_date),
+            ).fetchall()
+        return [(code, day) for code, day in rows]
+
+    def persist_valuation_batch(self, rows: list[ValuationBar], raw: list[RawRecord]) -> None:
+        self.initialize()
+        with self._connect() as conn:
+            for row in rows:
+                conn.execute(
+                    "INSERT INTO valuation_bars (ts_code,trade_date,pe_ttm,pb,ps_ttm,dividend_yield,turnover_rate,data_version) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ts_code,trade_date) DO UPDATE SET "
+                    "pe_ttm=EXCLUDED.pe_ttm,pb=EXCLUDED.pb,ps_ttm=EXCLUDED.ps_ttm,"
+                    "dividend_yield=EXCLUDED.dividend_yield,turnover_rate=EXCLUDED.turnover_rate,data_version=EXCLUDED.data_version",
+                    (row.ts_code, row.trade_date, row.pe_ttm, row.pb, row.ps_ttm, row.dividend_yield, row.turnover_rate, row.data_version),
+                )
+            self._persist_raw_records(conn, raw)
+
+    def index_member_codes_for_window(self, index_code: str, start_date: date, end_date: date) -> list[str]:
+        """Include the PIT snapshot at window start and every change through its end."""
+        self.initialize()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT ts_code FROM index_members
+                WHERE index_code=%s AND (
+                    effective_date=(SELECT max(effective_date) FROM index_members WHERE index_code=%s AND effective_date<=%s)
+                    OR effective_date BETWEEN %s AND %s
+                ) ORDER BY ts_code
+                """,
+                (index_code, index_code, start_date, start_date, end_date),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    def missing_historical_member_codes(self, index_code: str) -> list[str]:
+        """Find real index members absent from at least one core dataset."""
+        self.initialize()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT m.ts_code FROM index_members m
+                WHERE m.index_code=%s AND (
+                    NOT EXISTS (SELECT 1 FROM securities s WHERE s.ts_code=m.ts_code) OR
+                    NOT EXISTS (SELECT 1 FROM price_bars p WHERE p.ts_code=m.ts_code) OR
+                    NOT EXISTS (SELECT 1 FROM valuation_bars v WHERE v.ts_code=m.ts_code) OR
+                    NOT EXISTS (SELECT 1 FROM financials f WHERE f.ts_code=m.ts_code)
+                ) ORDER BY m.ts_code
+                """,
+                (index_code,),
+            ).fetchall()
         return [row[0] for row in rows]
 
     def record_run(self, run_type: str, status: str, parameters: dict | None = None, payload: dict | None = None, error: str | None = None) -> str:
@@ -1103,6 +1323,17 @@ class PostgresStore:
             rows = conn.execute("SELECT run_id::text,run_type,status,parameters,payload,error,created_at,completed_at FROM research_runs ORDER BY created_at DESC LIMIT %s", (limit,)).fetchall()
         return [{"run_id": row[0], "run_type": row[1], "status": row[2], "parameters": row[3], "payload": row[4], "error": row[5], "created_at": row[6], "completed_at": row[7]} for row in rows]
 
+    def list_factor_experiments(self) -> list[dict]:
+        """All saved FACTOR experiment headers, without loading large result payloads."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT run_id::text,status,parameters,created_at,payload->'metrics',payload->'equity_curve'->0->>'date',payload->'equity_curve'->-1->>'date' FROM research_runs WHERE run_type='backtest' AND parameters->>'strategy_type'='FACTOR' ORDER BY created_at DESC,run_id DESC").fetchall()
+        return [{"run_id": row[0], "run_type": "backtest", "status": row[1], "parameters": row[2], "created_at": row[3], "payload": {"metrics": row[4]}, "actual_start_date": row[5], "actual_end_date": row[6]} for row in rows]
+
+    def list_factor_target_simulations(self, public_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT payload,created_at FROM research_runs WHERE run_type='factor_target_simulation' AND parameters->>'experiment_id'=%s AND status='completed' ORDER BY created_at DESC LIMIT 20", (public_id,)).fetchall()
+        return [{**row[0], "saved_at": str(row[1])} for row in rows]
+
     def latest_run_summary(self, run_type: str, status: str | None = None) -> dict | None:
         """Return the latest run without deserializing historical factor rows for page reads."""
         status_clause = "AND status=%s" if status else ""
@@ -1129,20 +1360,37 @@ class PostgresStore:
 
     def data_quality(self, universe: str = "hs300") -> dict:
         """Persistable data-health report used by the CLI and management page."""
+        index_code = _QUALITY_INDEX_BY_UNIVERSE[universe]
         self.initialize()
         with self._connect() as conn:
             latest = conn.execute("SELECT max(trade_date) FROM price_bars").fetchone()[0]
-            codes = [row[0] for row in conn.execute("SELECT ts_code FROM securities ORDER BY ts_code")]
+            snapshot_date = conn.execute(
+                "SELECT max(effective_date) FROM index_members WHERE index_code=%s AND effective_date<=%s",
+                (index_code, latest),
+            ).fetchone()[0]
+            members = {
+                row[0] for row in conn.execute(
+                    "SELECT ts_code FROM index_members WHERE index_code=%s AND effective_date=%s",
+                    (index_code, snapshot_date),
+                )
+            } if snapshot_date else set()
+            master = {row[0] for row in conn.execute("SELECT ts_code FROM securities")}
             priced = {row[0] for row in conn.execute("SELECT ts_code FROM price_bars WHERE trade_date=%s", (latest,))} if latest else set()
             financial = {row[0] for row in conn.execute("SELECT DISTINCT ts_code FROM financials")}
+            valued = {row[0] for row in conn.execute("SELECT ts_code FROM valuation_bars WHERE trade_date=%s", (latest,))} if latest else set()
             valuation_count = conn.execute("SELECT count(*) FROM valuation_bars").fetchone()[0]
-        report = {
-            "universe": universe, "security_count": len(codes), "latest_trade_date": latest,
-            "latest_price_coverage": len(priced), "missing_latest_price_codes": sorted(set(codes) - priced) if latest else codes,
-            "missing_financial_codes": sorted(set(codes) - financial), "valuation_count": valuation_count,
-        }
-        report["is_complete"] = bool(codes and latest and not report["missing_latest_price_codes"] and not report["missing_financial_codes"] and valuation_count)
-        return report
+            benchmark_latest = conn.execute("SELECT max(trade_date) FROM benchmark_bars WHERE ts_code=%s", (index_code,)).fetchone()[0]
+            suspended = {
+                row[0] for row in conn.execute(
+                    "SELECT ts_code FROM trading_suspensions WHERE suspend_date<=%s "
+                    "AND (resume_date IS NULL OR %s<resume_date)",
+                    (latest, latest),
+                )
+            } if latest else set()
+        return _quality_report(
+            universe, latest, snapshot_date, members, master, priced,
+            financial, valued, valuation_count, benchmark_latest, suspended,
+        )
 
     def get_run(self, run_id: str) -> dict:
         with self._connect() as conn:

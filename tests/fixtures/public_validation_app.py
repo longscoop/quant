@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from copy import deepcopy
 
 import streamlit as st
 from datetime import date
@@ -86,6 +87,28 @@ class ValidationFixtureStore:
             "parameters": {"strategy_type": "FACTOR", "template_id": "quality_growth", "top_n": 30, "cost_bps": 10.0},
             "payload": {"coverage_summary": {"requested_periods": 44, "valid_periods": 31, "skipped_periods": 13}},
         }
+        suspended = {
+            "run_id": "factor-validation-suspended",
+            "run_type": "backtest",
+            "status": "partial",
+            "parameters": {"strategy_type": "FACTOR", "template_id": "value_growth", "top_n": 30, "cost_bps": 10.0},
+            "payload": {
+                "coverage_summary": {"requested_periods": 43, "valid_periods": 42, "skipped_periods": 1},
+                "status_reason": "2025-05-30 持仓证券停牌、无收盘价：688041.SH；当前回测不支持停牌持仓跨期延续",
+                "skipped_periods": [{"date": "2025-04-30", "exit_date": "2025-05-30", "reason": "2025-05-30 持仓证券停牌、无收盘价：688041.SH；当前回测不支持停牌持仓跨期延续"}],
+            },
+        }
+        completed_with_suspension = deepcopy(completed)
+        completed_with_suspension["payload"]["coverage_summary"] = {"requested_periods": 43, "valid_periods": 43, "skipped_periods": 0}
+        completed_with_suspension["payload"]["valuation_audit"] = [
+            {"date": "2025-05-30", "ts_code": "688041.SH", "mark_price": 136.13, "suspend_date": "2025-05-26", "resume_date": "2025-06-10"}
+        ]
+        completed_with_suspension["payload"]["order_audit"] = [
+            {"signal_date": "2025-05-30", "attempt_date": "2025-06-03", "ts_code": "688041.SH", "status": "deferred", "reason": "suspended"}
+        ]
+        completed_with_suspension["payload"]["trades"] = [
+            {"date": "2025-05-30", "execution_date": "2025-06-10", "ts_code": "688041.SH", "side": "SELL", "quantity": 10.0, "price": 148.0, "weight": 0.0, "deferred": True}
+        ]
         if state == "empty":
             self.runs = []
         elif state == "completed":
@@ -94,6 +117,10 @@ class ValidationFixtureStore:
             self.runs = [failed, newest_model, older_model]
         elif state == "factor_partial":
             self.runs = [partial]
+        elif state == "factor_suspended":
+            self.runs = [suspended]
+        elif state == "completed_with_suspension":
+            self.runs = [completed_with_suspension]
         elif state == "factor_ready_without_model":
             self.runs = []
         else:

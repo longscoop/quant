@@ -24,15 +24,17 @@ def select_positions(
     rebalance_date: date,
 ) -> list[Position]:
     """Turn a point-in-time prediction cross-section into equal-weight positions."""
-    snapshot = pit.snapshot(rebalance_date)
-    tradable = {security.ts_code for security in snapshot.universe}
-    ranked = [
+    candidates = [
         row
         for row in prediction_snapshot.rows
         if row.as_of_date == rebalance_date
-        and row.ts_code in tradable
         and (config.min_score is None or row.score >= config.min_score)
     ]
+    if not candidates:
+        return []
+    snapshot = pit.snapshot(rebalance_date)
+    tradable = {security.ts_code for security in snapshot.universe}
+    ranked = [row for row in candidates if row.ts_code in tradable]
     ranked = sorted(ranked, key=lambda row: row.score, reverse=True)[: max(1, config.top_n)]
     if not ranked:
         return []

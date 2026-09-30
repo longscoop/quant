@@ -9,10 +9,13 @@ from typing import Any
 from .research import (
     filter_research_candidates,
     latest_research_snapshot_date,
+    normalized_stock_benchmark_history,
     research_candidate_page,
     research_candidate_rows,
     research_data_freshness,
+    research_stock_detail,
 )
+from .insights import industry_summary_rows
 
 
 @dataclass(frozen=True)
@@ -155,4 +158,82 @@ def research_candidate_page_model(
         "reason": None,
         "rows": [_candidate(row) for row in result["rows"]],
         **{key: value for key, value in result.items() if key != "rows"},
+    }
+
+
+def research_stock_page_model(store, code: str) -> dict[str, Any] | None:
+    selector = _memory(store)
+    if code not in selector.securities:
+        return None
+    load_page_memory = getattr(store, "load_page_memory", None)
+    memory = (
+        load_page_memory(price_days=10_000, codes=[code], include_financials=True, include_valuations=True)
+        if load_page_memory is not None else store.load_memory()
+    )
+    detail = research_stock_detail(
+        memory,
+        code,
+        factor_run=_latest_completed_run(store, "factors"),
+        model_run=_latest_completed_run(store, "model"),
+    )
+    advanced = detail["专业详情"]
+    history = normalized_stock_benchmark_history(memory, code)
+    return {
+        "status": "COMPLETED" if detail["数据可信度"] != "不足" else "INSUFFICIENT_DATA",
+        "reason": None if detail["数据可信度"] != "不足" else detail["数据充分程度"],
+        "name": detail["名称"], "code": code, "industry": detail["行业"],
+        "as_of_date": detail["数据日期"], "tendency": detail["研究结论"],
+        "confidence": detail["数据可信度"], "risk": detail["风险水平"],
+        "core_advantage": detail["值得关注的原因"], "primary_risk": detail["主要风险"],
+        "sufficiency": detail["数据充分程度"],
+        "factor_score": advanced["因子综合分"], "coverage": advanced["数据覆盖率"],
+        "model_score": advanced["模型分数"],
+        "model_date": advanced["模型数据日期"], "factor_date": advanced["因子数据日期"],
+        "evidence_status": advanced["证据关联状态"],
+        "evidence_reason": advanced["证据不可用原因"],
+        "model_version": advanced["模型版本"], "factor_version": advanced["因子版本"],
+        "factor_model_version": advanced["因子模型版本"], "factor_data_version": advanced["因子数据版本"],
+        "evidence_groups": detail["证据组"],
+        "factor_evidence": advanced["因子证据"],
+        "financial_disclosures": advanced["财务披露"],
+        "valuation_trends": advanced["估值走势"],
+        "relative_history": {
+            "status": history["状态"], "reason": history["说明"],
+            "rows": [
+                {"date": str(row["日期"]), "stock": row["个股（归一化）"], "benchmark": row["沪深300（归一化）"]}
+                for row in history["数据"]
+            ],
+        },
+    }
+
+
+def research_industry_page_model(store) -> dict[str, Any]:
+    load_page_memory = getattr(store, "load_page_memory", None)
+    memory = load_page_memory(price_days=61) if load_page_memory is not None else store.load_memory()
+    factor_run = _latest_completed_run(store, "factors")
+    rankings = (factor_run.get("payload") or {}).get("rankings") or [] if factor_run else []
+    as_of = max((bar.trade_date for bar in memory.prices.values()), default=None)
+    rows = industry_summary_rows(memory, rankings=rankings, as_of=as_of)
+    members: dict[str, list[dict[str, str]]] = {}
+    latest_industry: dict[str, tuple[date, str]] = {}
+    for (code, effective), record in memory.industries.items():
+        if as_of is not None and effective > as_of:
+            continue
+        if code not in latest_industry or effective > latest_industry[code][0]:
+            latest_industry[code] = (effective, record.industry)
+    for code, (_, industry) in latest_industry.items():
+        security = memory.securities.get(code)
+        if security:
+            members.setdefault(industry, []).append({"code": code, "name": security.name})
+    return {
+        "status": "COMPLETED" if rows else "INSUFFICIENT_DATA",
+        "reason": None if rows else "行业研究数据正在准备。",
+        "as_of_date": str(as_of) if as_of else None,
+        "rows": [
+            {"name": row["行业"], "security_count": row["股票数量"],
+             "candidate_count": row["研究候选数量"], "label": row["景气标签"],
+             "relative_20d": row["20日相对表现"], "relative_60d": row["60日相对表现"],
+             "members": sorted(members.get(row["行业"], []), key=lambda item: item["code"])}
+            for row in rows
+        ],
     }

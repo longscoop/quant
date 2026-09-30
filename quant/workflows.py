@@ -23,7 +23,7 @@ from .markets import MarketConfig, ResearchContext, TimeSplitConfig, get_market
 from .pit import PITRepository
 from .scoring import FACTOR_MODEL_VERSION, PIT_DATA_VERSION
 from .providers import TushareProvider
-from .ingestion import SyncMode, sync_window
+from .ingestion import BASELINE_DATE, SyncMode, sync_window
 from .scheduler import DailySchedule, SHANGHAI
 from .types import RawRecord
 from .storage import PostgresStore, sanitize_for_storage, sanitize_sensitive_text
@@ -170,6 +170,8 @@ def reconcile_portfolio_orders(store, portfolio_id: str | None = None) -> dict:
                 code = order["ts_code"]
                 record = by_code.get(code)
                 target_quantity = float(batch.target_quantities.get(code, holdings.get(code, 0.0)))
+                if record is not None and record.get("reason") in {"missing_open", "missing_price"}:
+                    target_quantity = None
                 if record is None:
                     store.update_portfolio_order(
                         order["order_id"],
@@ -183,7 +185,8 @@ def reconcile_portfolio_orders(store, portfolio_id: str | None = None) -> dict:
                     continue
 
                 executed = float(record.get("executed_quantity") or 0.0)
-                remaining = float(record.get("remaining_quantity") or 0.0)
+                remaining_value = record.get("remaining_quantity")
+                remaining = float(remaining_value) if remaining_value is not None else None
                 reason = record.get("reason")
                 if executed > 0:
                     cost_audit = record.get("cost_audit") or {}
@@ -207,7 +210,7 @@ def reconcile_portfolio_orders(store, portfolio_id: str | None = None) -> dict:
                 elif reason in {"missing_open", "missing_price", "unknown_security"}:
                     status = "PENDING"
                     summary["pending_orders"] += 1
-                elif remaining > 1e-9 or reason == "insufficient_cash_or_position":
+                elif (remaining is not None and remaining > 1e-9) or reason == "insufficient_cash_or_position":
                     status = "PARTIAL"
                     summary["partial_orders"] += 1
                 else:
@@ -216,7 +219,7 @@ def reconcile_portfolio_orders(store, portfolio_id: str | None = None) -> dict:
 
                 store.update_portfolio_order(
                     order["order_id"],
-                    side=record["side"],
+                    side=order["side"] if reason in {"missing_open", "missing_price"} else record["side"],
                     target_quantity=target_quantity,
                     remaining_quantity=remaining,
                     planned_trade_date=execution_date,
@@ -459,6 +462,214 @@ def sync_hs300(store: PostgresStore, token: str, start_date: date, end_date: dat
     return sync_universe(store, token, universe="hs300", mode=SyncMode.BACKFILL, start_date=start_date, end_date=end_date, progress=progress, request_interval=request_interval)
 
 
+def sync_index_members_history(
+    store: PostgresStore,
+    token: str,
+    start_date: date,
+    end_date: date,
+    *,
+    request_interval: float = 0.35,
+    _locked: bool = False,
+) -> str:
+    """Fetch complete HS300 point-in-time membership snapshots month by month."""
+    if start_date < BASELINE_DATE or start_date > end_date:
+        raise ValueError("historical membership range must start on or after 2020-01-01 and end after its start")
+    if not _locked and hasattr(store, "sync_lock"):
+        with store.sync_lock("hs300") as acquired:
+            if not acquired:
+                raise RuntimeError("证券池 hs300 已有同步任务在运行")
+            return sync_index_members_history(
+                store, token, start_date, end_date,
+                request_interval=request_interval, _locked=True,
+            )
+
+    index_code = "000300.SH"
+    expected_members = 300
+    months = []
+    cursor = date(start_date.year, start_date.month, 1)
+    while cursor <= end_date:
+        last_day = date(cursor.year, cursor.month, monthrange(cursor.year, cursor.month)[1])
+        months.append((max(cursor, start_date), min(last_day, end_date)))
+        cursor = date(cursor.year + (cursor.month == 12), cursor.month % 12 + 1, 1)
+    parameters = sanitize_for_storage({"index_code": index_code, "start_date": start_date, "end_date": end_date})
+    run_id = store.record_run("membership_sync", "running", parameters, {"progress": {"phase": "准备历史成分", "current": 0, "total": len(months)}})
+    try:
+        provider = TushareProvider(token, start_date, end_date, request_interval=request_interval)
+    except Exception as exc:
+        store.finish_run(run_id, "failed", sanitize_for_storage({"requested_months": len(months), "snapshot_count": 0, "incomplete_months": [window_start.strftime("%Y-%m") for window_start, _ in months]}), error=sanitize_sensitive_text(str(exc)))
+        return run_id
+    incomplete_months = []
+    errors = []
+    snapshot_count = 0
+    member_row_count = 0
+    for position, (window_start, window_end) in enumerate(months, 1):
+        month_label = window_start.strftime("%Y-%m")
+        try:
+            frame = provider.index_weight(
+                index_code=index_code,
+                start_date=window_start.strftime("%Y%m%d"),
+                end_date=window_end.strftime("%Y%m%d"),
+            )
+            groups: dict[date, dict[str, object]] = {}
+            for row in frame.itertuples():
+                if getattr(row, "index_code", index_code) != index_code:
+                    continue
+                effective = provider._parse_source_date(getattr(row, "trade_date", None))
+                code = getattr(row, "con_code", None)
+                if effective is not None and code:
+                    groups.setdefault(effective, {})[str(code)] = row
+            valid = {day: rows for day, rows in groups.items() if len(rows) == expected_members}
+            if not valid or len(valid) != len(groups):
+                incomplete_months.append(month_label)
+            for day, rows in sorted(valid.items()):
+                store.sync_index_members(index_code, [(code, day) for code in sorted(rows)])
+                if hasattr(store, "persist_raw_records"):
+                    store.persist_raw_records([
+                        RawRecord("index_weight", code, provider._source_payload(row), report_period=day)
+                        for code, row in rows.items()
+                    ])
+                snapshot_count += 1
+                member_row_count += len(rows)
+        except Exception as exc:
+            incomplete_months.append(month_label)
+            errors.append({"month": month_label, "error": sanitize_sensitive_text(str(exc))})
+        store.update_run_progress(run_id, sanitize_for_storage({"phase": "历史成分", "current": position, "total": len(months), "month": month_label, "updated_at": datetime.now(UTC).isoformat()}))
+    status = "completed" if not incomplete_months else "partial" if snapshot_count else "failed"
+    store.finish_run(run_id, status, sanitize_for_storage({
+        "requested_months": len(months), "snapshot_count": snapshot_count,
+        "member_row_count": member_row_count, "incomplete_months": incomplete_months,
+        "dataset_errors": errors,
+    }), error="没有取得完整的历史成分快照" if status == "failed" else None)
+    return run_id
+
+
+def backfill_missing_members(
+    store: PostgresStore,
+    token: str,
+    start_date: date,
+    end_date: date,
+    *,
+    request_interval: float = 0.35,
+    _locked: bool = False,
+) -> str:
+    """Fetch source data only for historical HS300 members missing core rows."""
+    if start_date < BASELINE_DATE or start_date > end_date:
+        raise ValueError("member backfill range must start on or after 2020-01-01 and end after its start")
+    if not _locked and hasattr(store, "sync_lock"):
+        with store.sync_lock("hs300") as acquired:
+            if not acquired:
+                raise RuntimeError("证券池 hs300 已有同步任务在运行")
+            return backfill_missing_members(store, token, start_date, end_date, request_interval=request_interval, _locked=True)
+
+    index_code = "000300.SH"
+    codes = store.missing_historical_member_codes(index_code)
+    parameters = sanitize_for_storage({"index_code": index_code, "start_date": start_date, "end_date": end_date, "security_count": len(codes)})
+    run_id = store.record_run("member_gap_sync", "running", parameters, {"progress": {"phase": "准备缺失历史成员", "current": 0, "total": len(codes)}})
+    if not codes:
+        store.finish_run(run_id, "completed", {"requested_codes": 0, "remaining_codes": [], "dataset_errors": []})
+        return run_id
+    try:
+        def report(phase, current, total, detail=None):
+            store.update_run_progress(run_id, sanitize_for_storage({"phase": phase, "current": current, "total": total, "detail": detail, "updated_at": datetime.now(UTC).isoformat()}))
+
+        provider = TushareProvider(token, start_date, end_date, universe=codes, progress=report, request_interval=request_interval)
+        store.sync(provider, sync_key=f"hs300:member-gaps:{start_date.isoformat()}:{end_date.isoformat()}")
+        remaining = store.missing_historical_member_codes(index_code)
+        status = "partial" if provider.errors or remaining else "completed"
+        store.finish_run(run_id, status, sanitize_for_storage({
+            "requested_codes": len(codes), "remaining_codes": remaining,
+            "dataset_errors": provider.errors,
+        }))
+    except Exception as exc:
+        store.finish_run(run_id, "failed", sanitize_for_storage({"requested_codes": len(codes)}), error=sanitize_sensitive_text(str(exc)))
+    return run_id
+
+
+def sync_suspensions_history(
+    store: PostgresStore,
+    token: str,
+    start_date: date,
+    end_date: date,
+    *,
+    request_interval: float = 0.35,
+    _locked: bool = False,
+) -> str:
+    """Repair historical HS300 suspension events without replaying other datasets."""
+    if start_date < BASELINE_DATE or start_date > end_date:
+        raise ValueError("suspension range must start on or after 2020-01-01 and end after its start")
+    if not _locked and hasattr(store, "sync_lock"):
+        with store.sync_lock("hs300") as acquired:
+            if not acquired:
+                raise RuntimeError("证券池 hs300 已有同步任务在运行")
+            return sync_suspensions_history(store, token, start_date, end_date, request_interval=request_interval, _locked=True)
+
+    codes = sorted(store.index_member_codes("000300.SH"))
+    parameters = sanitize_for_storage({"index_code": "000300.SH", "start_date": start_date, "end_date": end_date, "security_count": len(codes)})
+    run_id = store.record_run("suspension_sync", "running", parameters, {"progress": {"phase": "准备停复牌", "current": 0, "total": len(codes)}})
+    if not codes:
+        store.finish_run(run_id, "failed", {"dataset_errors": []}, error="缺少沪深300历史成分快照")
+        return run_id
+    try:
+        def report(phase, current, total, detail=None):
+            store.update_run_progress(run_id, sanitize_for_storage({"phase": phase, "current": current, "total": total, "detail": detail, "updated_at": datetime.now(UTC).isoformat()}))
+
+        provider = TushareProvider(token, start_date, end_date, universe=codes, progress=report, request_interval=request_interval)
+        # v3 rebuilds source periods after same-day R/S ordering was fixed.
+        store.sync_suspensions(provider, sync_key=f"hs300:suspensions:v3:{start_date.isoformat()}:{end_date.isoformat()}")
+        status = "partial" if provider.errors else "completed"
+        store.finish_run(run_id, status, sanitize_for_storage({"requested_codes": len(codes), "dataset_errors": provider.errors}))
+    except Exception as exc:
+        store.finish_run(run_id, "failed", {"requested_codes": len(codes)}, error=sanitize_sensitive_text(str(exc)))
+    return run_id
+
+
+def backfill_valuation_gaps(
+    store: PostgresStore,
+    token: str,
+    start_date: date,
+    end_date: date,
+    *,
+    request_interval: float = 0.35,
+    _locked: bool = False,
+) -> str:
+    """Fetch daily_basic only where a historical member has a real price but no valuation."""
+    if start_date < BASELINE_DATE or start_date > end_date:
+        raise ValueError("valuation gap range must start on or after 2020-01-01 and end after its start")
+    if not _locked and hasattr(store, "sync_lock"):
+        with store.sync_lock("hs300") as acquired:
+            if not acquired:
+                raise RuntimeError("证券池 hs300 已有同步任务在运行")
+            return backfill_valuation_gaps(store, token, start_date, end_date, request_interval=request_interval, _locked=True)
+
+    index_code = "000300.SH"
+    missing = store.missing_valuation_days(index_code, start_date, end_date)
+    codes = sorted({code for code, _ in missing})
+    source_start = min((day for _, day in missing), default=start_date)
+    source_end = max((day for _, day in missing), default=end_date)
+    parameters = sanitize_for_storage({"index_code": index_code, "start_date": start_date, "end_date": end_date, "source_start": source_start, "source_end": source_end, "security_count": len(codes), "missing_days": len(missing)})
+    run_id = store.record_run("valuation_gap_sync", "running", parameters, {"progress": {"phase": "准备估值缺口", "current": 0, "total": len(codes)}})
+    if not missing:
+        store.finish_run(run_id, "completed", {"requested_days": 0, "remaining_days": [], "dataset_errors": []})
+        return run_id
+    try:
+        def report(phase, current, total, detail=None):
+            store.update_run_progress(run_id, sanitize_for_storage({"phase": phase, "current": current, "total": total, "detail": detail, "updated_at": datetime.now(UTC).isoformat()}))
+
+        provider = TushareProvider(token, source_start, source_end, universe=codes, progress=report, request_interval=request_interval)
+        for code, rows in provider.iter_valuation_batches():
+            store.persist_valuation_batch(rows, provider.raw_market_records_for(code))
+        remaining = store.missing_valuation_days(index_code, start_date, end_date)
+        status = "partial" if provider.errors or remaining else "completed"
+        store.finish_run(run_id, status, sanitize_for_storage({
+            "requested_days": len(missing),
+            "remaining_days": [{"ts_code": code, "trade_date": day} for code, day in remaining],
+            "dataset_errors": provider.errors,
+        }))
+    except Exception as exc:
+        store.finish_run(run_id, "failed", {"requested_days": len(missing)}, error=sanitize_sensitive_text(str(exc)))
+    return run_id
+
+
 def sync_benchmark(
     store: PostgresStore,
     token: str,
@@ -524,10 +735,34 @@ def sync_universe(store: PostgresStore, token: str, *, universe: str = "hs300", 
 
         report("获取沪深300成分", 0, 1)
         bootstrap = TushareProvider(token, market_window.start, end_date, request_interval=request_interval)
-        weights = bootstrap.index_weight(index_code="000300.SH", start_date=market_window.start.strftime("%Y%m%d"), end_date=end_date.strftime("%Y%m%d"))
-        members = [(getattr(row, "con_code"), date.fromisoformat(getattr(row, "trade_date"))) for row in weights.itertuples() if getattr(row, "con_code", None) and getattr(row, "trade_date", None)]
-        historical_codes = set(store.index_member_codes("000300.SH")) if hasattr(store, "index_member_codes") else set()
-        codes = sorted({code for code, _ in members} | historical_codes)
+        if hasattr(store, "index_member_codes_for_window"):
+            historical_codes = set(store.index_member_codes_for_window("000300.SH", market_window.start, end_date))
+        else:
+            historical_codes = set(store.index_member_codes("000300.SH")) if hasattr(store, "index_member_codes") else set()
+        membership_errors = []
+        try:
+            weights = bootstrap.index_weight(index_code="000300.SH", start_date=market_window.start.strftime("%Y%m%d"), end_date=end_date.strftime("%Y%m%d"))
+        except Exception as exc:
+            if not historical_codes:
+                raise
+            weights = pd.DataFrame()
+            membership_errors.append({"dataset": "index_members", "error": sanitize_sensitive_text(str(exc))})
+        source_members = []
+        by_day: dict[date, set[str]] = {}
+        for row in weights.itertuples():
+            code = getattr(row, "con_code", None)
+            raw_day = getattr(row, "trade_date", None)
+            if not code or not raw_day:
+                continue
+            day = date.fromisoformat(str(raw_day))
+            source_members.append((code, day))
+            by_day.setdefault(day, set()).add(code)
+        complete_days = {day for day, day_codes in by_day.items() if len(day_codes) == 300}
+        incomplete_days = sorted(day for day in by_day if day not in complete_days)
+        if incomplete_days:
+            membership_errors.append({"dataset": "index_members", "error": "成分快照不足 300 只", "dates": incomplete_days})
+        members = sorted({(code, day) for code, day in source_members if day in complete_days})
+        codes = sorted({code for code, _ in source_members} | historical_codes)
         if not codes:
             raise RuntimeError("沪深300成分接口未返回证券代码；请检查 Tushare Token 权限或日期范围")
         report("获取沪深300成分", 1, 1)
@@ -544,14 +779,14 @@ def sync_universe(store: PostgresStore, token: str, *, universe: str = "hs300", 
         report("写入数据库", 1, 1)
         counts = store.status()["counts"] if hasattr(store, "status") else {}
         quality = store.data_quality(universe) if hasattr(store, "data_quality") else {}
-        status = "partial" if provider.errors else "completed"
-        dataset_errors = sanitize_for_storage(provider.errors)
+        status = "partial" if provider.errors or membership_errors else "completed"
+        dataset_errors = sanitize_for_storage(provider.errors + membership_errors)
         error_summary = "; ".join(str(item.get("error", "")) for item in dataset_errors) or None
         for dataset, watermark in (("market", market_window.end), ("financial", financial_window.end), ("base", end_date)):
             if hasattr(store, "set_sync_state"):
-                store.set_sync_state(universe, dataset, watermark if not provider.errors else None, status, run_id, error_summary)
+                store.set_sync_state(universe, dataset, watermark if status == "completed" else None, status, run_id, error_summary)
         portfolio_refresh = refresh_portfolios_after_market_sync(store) if hasattr(store, "list_portfolios") else None
-        store.finish_run(run_id, status, sanitize_for_storage({"securities": len(codes), "member_versions": len(members), "row_counts": counts, "quality": quality, "dataset_errors": dataset_errors, "portfolio_refresh": portfolio_refresh}))
+        store.finish_run(run_id, status, sanitize_for_storage({"securities": len(codes), "member_versions": len(members), "membership_snapshot_count": len(complete_days), "row_counts": counts, "quality": quality, "dataset_errors": dataset_errors, "portfolio_refresh": portfolio_refresh}))
         return run_id
     except Exception as exc:
         try:
@@ -1214,7 +1449,7 @@ def _monthly_rebalance_dates(store, start_date: date, end_date: date) -> list[da
 def _historical_universe_version(memory, as_of_date: date) -> str:
     members = sorted(memory.members_for("000300.SH", as_of_date)) if hasattr(memory, "members_for") else []
     digest = sha256("|".join(members).encode("utf-8")).hexdigest()[:16]
-    return f"hs300:{digest}"
+    return f"hs300:members-v3:{digest}"
 
 
 def run_factor_backtest_run(
@@ -1226,21 +1461,25 @@ def run_factor_backtest_run(
     top_n: int = 30,
     cost_bps: float = 10.0,
     experiment_name: str | None = None,
+    initial_capital: float = 1_000_000.0,
     progress=None,
 ) -> str:
     """Build/reuse monthly PIT snapshots and run the independent FACTOR path."""
-    parameters = {"strategy_type": "FACTOR", "top_n": top_n, "cost_bps": cost_bps, "frequency": "monthly", "benchmark": "000300.SH", "factor_version": FACTOR_MODEL_VERSION, "pit_version": PIT_DATA_VERSION, "template_id": template_id, "experiment_name": experiment_name or "未命名实验", "start_date": start_date, "end_date": end_date}
+    from .validation_portfolio import validate_capital
+    initial_capital = validate_capital(initial_capital)
+    parameters = {"strategy_type": "FACTOR", "top_n": top_n, "cost_bps": cost_bps, "frequency": "monthly", "benchmark": "000300.SH", "factor_version": FACTOR_MODEL_VERSION, "pit_version": PIT_DATA_VERSION, "template_id": template_id, "experiment_name": experiment_name or "未命名实验", "start_date": start_date, "end_date": end_date, "initial_capital": initial_capital}
     try:
         memory = store.load_memory() if hasattr(store, "load_memory") else store
         dates = _monthly_rebalance_dates(memory, start_date, end_date)
         prediction_rows, snapshot_events = [], []
-        total = len(dates)
-        for current, day in enumerate(dates, 1):
+        total = max(0, len(dates) - 1)
+        for current, day in enumerate(dates[:-1], 1):
             universe_version = _historical_universe_version(memory, day)
             existing = store.get_factor_snapshot(day, FACTOR_MODEL_VERSION, PIT_DATA_VERSION, universe_version)
             if progress:
                 progress({"event": "snapshot_check", "current": current, "total": total, "date": day, "status": "reused" if existing else "missing"})
-            snapshot = ensure_factor_snapshot(store, day, factor_version=FACTOR_MODEL_VERSION, pit_version=PIT_DATA_VERSION, universe_version=universe_version, memory=memory)
+            members = sorted(memory.members_for("000300.SH", day)) if hasattr(memory, "members_for") else []
+            snapshot = ensure_factor_snapshot(store, day, factor_version=FACTOR_MODEL_VERSION, pit_version=PIT_DATA_VERSION, universe_version=universe_version, universe_codes=members, memory=memory)
             if snapshot.get("status") not in {"completed", "degraded"}:
                 event = {"event": "snapshot_failed", "current": current, "total": total, "date": day, "reason": "PIT 因子快照覆盖率不足 80%"}
                 snapshot_events.append(event)
@@ -1265,12 +1504,20 @@ def run_factor_backtest_run(
             backtest_events.append(event)
             if progress:
                 progress(event)
-        result = run_backtest(BacktestConfig(top_n=top_n, transaction_cost_bps=cost_bps), prediction, PITRepository(memory), skip_invalid_periods=True, progress=report_backtest)
-        output = {"metrics": result.metrics, "equity_curve": [{"date": day, "value": value} for day, value in result.equity_curve], "benchmark_curve": [{"date": day, "value": value} for day, value in result.benchmark_curve], "excess_curve": [{"date": day, "value": value} for day, value in result.excess_curve], "annual_returns": result.annual_returns, "positions": [position.__dict__ for position in result.positions], "trades": result.trades, "status_reason": result.status_reason, "snapshot_events": snapshot_events, "backtest_events": backtest_events}
-        valid_periods = len(result.equity_curve)
+        result = run_backtest(BacktestConfig(top_n=top_n, transaction_cost_bps=cost_bps), prediction, PITRepository(memory), skip_invalid_periods=True, rebalance_schedule=dates, progress=report_backtest)
+        output = {"metrics": result.metrics, "equity_curve": [{"date": day, "value": value} for day, value in result.equity_curve], "benchmark_curve": [{"date": day, "value": value} for day, value in result.benchmark_curve], "excess_curve": [{"date": day, "value": value} for day, value in result.excess_curve], "annual_returns": result.annual_returns, "positions": [position.__dict__ for position in result.positions], "trades": result.trades, "skipped_periods": result.skipped_periods, "valuation_audit": result.valuation_audit, "order_audit": result.order_audit, "status_reason": result.status_reason, "snapshot_events": snapshot_events, "backtest_events": backtest_events}
+        valid_periods = result.completed_periods if result.completed_periods is not None else len(result.equity_curve)
         skipped_periods = max(0, total - valid_periods)
         output["coverage_summary"] = {"requested_periods": total, "valid_periods": valid_periods, "skipped_periods": skipped_periods}
         status = "insufficient_data" if valid_periods < 2 else "partial" if skipped_periods else "completed"
+        if skipped_periods and not output["status_reason"]:
+            reasons = {event.get("reason") for event in backtest_events + snapshot_events if event.get("reason")}
+            output["status_reason"] = "；".join(sorted(reasons)) or "部分月度区间缺少可回测数据"
+        if status != "completed":
+            output.update({
+                "metrics": {}, "equity_curve": [], "benchmark_curve": [], "excess_curve": [],
+                "annual_returns": [], "positions": [], "trades": [],
+            })
         if progress:
             progress({"event": "completed", "status": status, **output["coverage_summary"]})
         return store.record_run("backtest", status, sanitize_for_storage(parameters), sanitize_for_storage(output))

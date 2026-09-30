@@ -368,6 +368,24 @@ def run_qlib_quantity_backtest(
         strategy_builder = strategy_factory or create_monthly_topn_strategy
         strategy = strategy_builder(signal=prediction, top_n=config.top_n)
     cost_rate = float(cost_bps) / 10_000
+    open_cost = close_cost = cost_rate
+    min_cost = 0.0
+    if shared_records:
+        audits = [row.get("cost_audit") or {} for row in shared_records]
+        specified = [audit for audit in audits if "buy_commission_bps" in audit]
+        if specified:
+            terms = {
+                key: float(specified[0].get(key, 0.0))
+                for key in (
+                    "buy_commission_bps", "sell_commission_bps", "sell_tax_bps",
+                    "minimum_commission", "slippage_bps",
+                )
+            }
+            if any(any(float(audit.get(key, 0.0)) != value for key, value in terms.items()) for audit in specified):
+                raise ValueError("shared orders use inconsistent transaction cost terms")
+            open_cost = (terms["buy_commission_bps"] + terms["slippage_bps"]) / 10_000
+            close_cost = (terms["sell_commission_bps"] + terms["sell_tax_bps"] + terms["slippage_bps"]) / 10_000
+            min_cost = terms["minimum_commission"]
     report, positions = backtest_func(
         start_time=config.start_date.isoformat(),
         end_time=config.end_date.isoformat(),
@@ -378,9 +396,9 @@ def run_qlib_quantity_backtest(
             "freq": "day",
             "limit_threshold": None,
             "deal_price": "open",
-            "open_cost": cost_rate,
-            "close_cost": cost_rate,
-            "min_cost": 0.0,
+            "open_cost": open_cost,
+            "close_cost": close_cost,
+            "min_cost": min_cost,
             "trade_unit": int(trade_unit),
         },
     )

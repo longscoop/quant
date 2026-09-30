@@ -156,7 +156,7 @@ class WorkbenchInsightsTests(unittest.TestCase):
     def test_factor_backtest_uses_snapshots_and_persists_partial_summary_and_events(self):
         """The public FACTOR workflow must report each snapshot and never read a model run."""
         from quant.types import BenchmarkBar, PredictionRow, PredictionSnapshot
-        from quant.workflows import run_factor_backtest_run
+        from quant.workflows import _historical_universe_version, run_factor_backtest_run
 
         class RunStore(InMemoryStore):
             def record_run(self, run_type, status, parameters, payload=None, error=None):
@@ -164,9 +164,10 @@ class WorkbenchInsightsTests(unittest.TestCase):
                 return "factor-backtest-1"
 
         store = RunStore()
-        for day in (date(2024, 1, 31), date(2024, 2, 29), date(2024, 3, 29)):
+        for day in (date(2024, 1, 31), date(2024, 2, 29), date(2024, 3, 29), date(2024, 4, 30)):
             store.benchmarks[("000300.SH", day)] = BenchmarkBar("000300.SH", day, 4000.0, 3990.0)
-        store.record_factor_snapshot({"as_of_date": date(2024, 2, 29), "factor_version": "pit_v1.1", "pit_version": "pit_v1.0", "universe_version": "hs300:e3b0c44298fc1c14", "status": "completed"}, [])
+        store.sync_index_members("000300.SH", [("000001.SZ", date(2024, 1, 31))])
+        store.record_factor_snapshot({"as_of_date": date(2024, 2, 29), "factor_version": "pit_v1.1", "pit_version": "pit_v1.0", "universe_version": _historical_universe_version(store, date(2024, 2, 29)), "status": "completed"}, [])
         snapshots = {
             date(2024, 1, 31): {"status": "completed", "items": [{"ts_code": "000001.SZ"}], "reused": False},
             date(2024, 2, 29): {"status": "completed", "items": [{"ts_code": "000001.SZ"}], "reused": True},
@@ -177,20 +178,25 @@ class WorkbenchInsightsTests(unittest.TestCase):
         def predictions(_items, as_of_date, _template_id):
             return PredictionSnapshot([PredictionRow(as_of_date, "000001.SZ", 90.0)], {})
 
-        result = BacktestResult([], [(date(2024, 1, 31), 1.01), (date(2024, 2, 29), 1.02)], {"total_return": .02}, [{"date": date(2024, 1, 31)}])
-        with patch("quant.workflows.ensure_factor_snapshot", side_effect=lambda _store, day, **_kwargs: snapshots[day]), patch("quant.workflows.factor_predictions", side_effect=predictions), patch("quant.workflows.run_backtest", return_value=result):
+        result = BacktestResult([], [(date(2024, 1, 31), 1.01), (date(2024, 2, 29), 1.02)], {"total_return": .02}, [{"date": date(2024, 1, 31)}], skipped_periods=[{"date": date(2024, 3, 29), "reason": "缺少行情"}])
+        with patch("quant.workflows.ensure_factor_snapshot", side_effect=lambda _store, day, **_kwargs: snapshots[day]) as ensure_snapshot, patch("quant.workflows.factor_predictions", side_effect=predictions), patch("quant.workflows.run_backtest", return_value=result):
             run_factor_backtest_run(
                 store,
                 start_date=date(2024, 1, 1),
-                end_date=date(2024, 3, 31),
+                end_date=date(2024, 4, 30),
                 template_id="quality_growth",
                 progress=events.append,
             )
 
         self.assertEqual(store.recorded["parameters"]["strategy_type"], "FACTOR")
+        self.assertTrue(all(call.kwargs["universe_codes"] == ["000001.SZ"] for call in ensure_snapshot.call_args_list))
         self.assertNotIn("model_run_id", store.recorded["parameters"])
         self.assertEqual(store.recorded["status"], "partial")
+        self.assertEqual(store.recorded["payload"]["status_reason"], "PIT 因子快照覆盖率不足 80%")
         self.assertEqual(store.recorded["payload"]["coverage_summary"], {"requested_periods": 3, "valid_periods": 2, "skipped_periods": 1})
+        self.assertEqual(store.recorded["payload"]["skipped_periods"], [{"date": date(2024, 3, 29), "reason": "缺少行情"}])
+        self.assertEqual(store.recorded["payload"]["metrics"], {})
+        self.assertEqual(store.recorded["payload"]["equity_curve"], [])
         self.assertEqual([event["event"] for event in events], ["snapshot_check", "snapshot_built", "snapshot_check", "snapshot_reused", "snapshot_check", "snapshot_failed", "completed"])
         self.assertEqual([event["status"] for event in events if event["event"] == "snapshot_check"], ["missing", "reused", "missing"])
 

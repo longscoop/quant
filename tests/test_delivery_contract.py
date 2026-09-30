@@ -198,6 +198,7 @@ class DeliveryContractTests(unittest.TestCase):
 
         store.initialize()
 
+        self.assertEqual(connection.queries[0], "SELECT pg_advisory_xact_lock(hashtext('quant-schema-initialize'))")
         for column in ("pe", "pb", "ps", "dividend_yield"):
             self.assertIn(f"ALTER TABLE financials DROP COLUMN IF EXISTS {column}", connection.queries)
 
@@ -517,8 +518,11 @@ class DeliveryContractTests(unittest.TestCase):
         )
         services = json.loads(result.stdout)["services"]
 
-        self.assertTrue({"api", "frontend", "streamlit"}.issubset(services))
+        self.assertTrue({"api", "frontend"}.issubset(services))
+        self.assertNotIn("streamlit", services)
         self.assertEqual(services["api"]["command"][:2], ["uvicorn", "backend.app.main:app"])
+        self.assertNotIn("ports", services["api"])
+        self.assertEqual(services["frontend"]["ports"][0]["published"], "5173")
         self.assertNotIn("DATABASE_URL", services["frontend"].get("environment", {}))
 
     @unittest.skipUnless(shutil.which("docker"), "Docker is not installed")
@@ -533,11 +537,19 @@ class DeliveryContractTests(unittest.TestCase):
         )
         services = json.loads(result.stdout)["services"]
 
-        for service_name in ("streamlit", "api", "scheduler", "quant"):
-            self.assertEqual(services[service_name]["image"], "a-share-quant:dev")
-        self.assertIn("build", services["streamlit"])
         for service_name in ("api", "scheduler", "quant"):
-            self.assertNotIn("build", services[service_name])
+            self.assertEqual(services[service_name]["image"], "a-share-quant:dev")
+        self.assertIn("build", services["api"])
+        for service_name in ("scheduler", "quant"):
+            self.assertFalse("build" in services[service_name], f"{service_name} must reuse the shared Python image")
+        legacy = subprocess.run(
+            ["docker", "compose", "--profile", "legacy", "config", "--format", "json"],
+            cwd=Path(__file__).resolve().parents[1],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(json.loads(legacy.stdout)["services"]["streamlit"]["image"], "a-share-quant:dev")
 
 
 if __name__ == "__main__":

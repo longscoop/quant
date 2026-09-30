@@ -7,9 +7,9 @@
 - 仅处理沪深300成分股；数据同步按证券代码分批请求，兼容非 VIP Tushare 账户。
 - 六类因子：价值、质量、成长、动量、低波动、流动性；仅使用截至计算日已知的数据。
 - FACTOR 与 MODEL 是独立路径。MODEL 使用 `DataHandlerLP → DatasetH(train/valid/test) → qlib.contrib.model.gbdt.LGBModel → SignalRecord / IC / RankIC`；旧直接 LightGBM 仅保留在 legacy 命名空间用于显式对照。
-- 每月调仓的 Top-N 多头回测；公开“历史验证”默认按月复用或补算 PIT 因子快照，以模板评分形成 FACTOR 信号，并记录交易成本、可交易性过滤、持仓和调仓明细。
+- 每月调仓的 Top-N 多头回测；公开“历史回测实验”默认按月复用或补算 PIT 因子快照，以模板评分形成 FACTOR 信号，并记录交易成本、可交易性过滤、持仓和调仓明细。
 - 多组合研究模拟账本：保存目标权重形成不可覆盖版本，严格按 `T` 日收盘信号、`T+1` 下一交易日真实开盘价模拟成交，并由成交、现金和每日收盘行情计算持仓成本、收益、回撤、行业/PIT 因子暴露及调仓记录。默认初始资金 100 万元、单边成本 5 bps，均可按组合配置。
-- Streamlit 公开研究页面：研究首页、候选池、个股详情、行业观察、我的组合、历史验证和数据状态；普通用户只看研究证据与历史模拟，不接触运行编号、任务控制或底层错误。另提供受部署开关控制的管理员工作台，用于准备数据与诊断任务。
+- React + FastAPI 研究页面：工作台、选股、我的组合、历史回测实验四个主入口；个股详情由股票搜索或候选进入，行业观察与数据状态保留独立入口；普通用户只看研究证据与历史模拟，不接触运行编号、任务控制或底层错误。另提供受部署开关控制的管理员工作台，用于准备数据与诊断任务。
 
 ## 受控管理员部署前置条件
 
@@ -18,13 +18,13 @@
 
 ## 管理员工作台
 
-管理员工作台默认关闭。仅在受控部署中设置 `QUANT_ADMIN_MODE=1`，然后重启 Streamlit。普通用户部署不要设置该变量。
+管理员工作台默认关闭。仅在受控部署中设置 `QUANT_ADMIN_MODE=1`，然后重启 API。普通用户部署不要设置该变量。
 
 `QUANT_ADMIN_MODE` 只是部署开关，不是登录或权限系统。如需同时提供公开页面与管理页面，请使用两个部署实例，并只在内部实例启用管理员模式。
 
 管理员工作台按“数据同步 → 完整性检查 → 因子构建 → 模型生成”执行。Tushare Token 只从密码输入或 `TUSHARE_TOKEN` 环境变量读取，不写入数据库。
 
-公开实例面向普通用户：不配置 `DATABASE_URL` 或 Tushare Token，也不显示管理员入口、数据库配置或 Token 指引。数据库连接和 Token 仅由受控内部管理员部署的运维人员配置；不要把这些值保存、打印或传给普通用户。
+公开实例面向普通用户：API 服务端配置数据库连接，但不配置 Tushare Token 或管理员开关；前端容器不接收数据库连接、Token 或管理员任务配置。管理员功能只在独立受控部署中开启。
 
 ## Docker Compose
 
@@ -35,11 +35,11 @@ docker compose up --build
 ```
 
 首次部署或 `pyproject.toml` / `frontend/package-lock.json` 变更后，可先运行
-`docker compose build streamlit frontend` 预热基础镜像和依赖缓存；随后 `docker compose up`
-会复用同一个 Python 镜像给 Streamlit、API、scheduler 和任务命令。`data/postgres` 始终作为
+`docker compose build api frontend` 预热基础镜像和依赖缓存；随后 `docker compose up`
+会复用同一个 Python 镜像给 API、scheduler 和任务命令。`data/postgres` 始终作为
 PostgreSQL 的宿主机卷挂载，不参与应用镜像构建。Qlib Recorder artifact 持久化在 `data/qlib`（容器内 `/app/data/qlib`）。
 
-上述 Compose 配置用于受控的内部管理员部署；数据库连接由服务环境提供，而非在侧栏输入。设置 `QUANT_ADMIN_MODE=1` 后打开 `http://localhost:8501`，在“管理员”页面完成首次数据同步。公开部署应作为独立实例运行，且不要设置管理员开关、数据库连接或 Token。
+上述 Compose 配置用于受控的内部管理员部署；数据库连接由服务环境提供，而非在页面输入。打开 `http://localhost:5173` 使用研究工作台，浏览器 API 请求由前端容器转发到内部 `api:8000`，不需要打开 8000 端口。设置 `QUANT_ADMIN_MODE=1` 后重启 API，页面才会出现“管理员”入口。公开部署应作为独立实例运行，不设置管理员开关或 Token。旧 Streamlit 界面仅在执行 `docker compose --profile legacy up streamlit` 时启动。
 
 CLI 同步/研究任务可由 cron 调用：
 
@@ -63,7 +63,9 @@ export TUSHARE_TOKEN='你的 Token'
 export QUANT_ADMIN_MODE=1
 python -m quant.cli init-db
 python -m quant.cli sync-hs300 --start-date 2024-01-01 --end-date 2025-01-01
-streamlit run streamlit_app.py
+.venv/bin/uvicorn backend.app.main:app --port 8000
+npm --prefix frontend install
+npm --prefix frontend run dev
 ```
 
 ## 数据补齐与每日同步
@@ -71,9 +73,38 @@ streamlit run streamlit_app.py
 首次运行使用历史补数；它从 2020-01-01 起保留基础资料、日频行情、每日估值和财务报表原始版本：
 
 ```bash
-python -m quant.cli sync-universe --universe hs300 --mode backfill --start-date 2020-01-01
-python -m quant.cli audit-data --universe hs300
+python -m quant.cli init-db
+python -m quant.cli sync-index-members --start-date 2020-01-01 --end-date 2026-08-31
+python -m quant.cli backfill-data --start-date 2020-01-01
 ```
+
+`backfill-data` 使用 `TUSHARE_TOKEN`，依次运行沪深300历史补数与沪深300基准开收盘价补数，输出两个运行 ID、运行状态和落库完整性报告。可用 `--end-date YYYY-MM-DD` 限定终点，或在受控部署中运行 `docker compose --profile jobs run --rm quant backfill-data --start-date 2020-01-01`。若任一任务失败、部分成功，或完整性报告仍有缺口，命令以非零状态退出；根据输出中的缺口及运行记录检查 Tushare 权限和数据覆盖后重试。报告检查最新行情日时点成分的行情、财务记录和当日估值，不代表所选历史区间逐日完整。
+
+历史回测还需要当时的成分关系，因此首次补数先按月同步真实沪深300成分快照。上例中的 `2026-08-31` 是当时已完成的最后一个月末；之后运行时应改为最近已有快照的月末。该任务只写入每个快照日确实取得的完整 300 只成分；没有取得完整快照的月份会在运行记录中列出，命令以非零状态退出。补齐成分后，还需检查新增历史成员在回测区间的行情、估值和财务覆盖。月度接口在尚未产生新快照的当月可能不返回数据；此时任务会如实报告缺口。
+
+针对已落库成分中缺少基础资料、行情、估值或财务记录的证券，可只补这些代码，避免重复请求已有成员：
+
+```bash
+python -m quant.cli backfill-member-gaps --start-date 2020-01-01 --end-date 2026-09-28
+python -m quant.cli sync-suspensions --start-date 2020-01-01 --end-date 2026-09-29
+python -m quant.cli backfill-valuation-gaps --start-date 2020-01-01 --end-date 2026-09-29
+```
+
+运行记录会列出仍无核心数据的代码及源接口错误。这个检查以证券是否至少有一条记录为界，不能替代回测区间的逐日覆盖审计。
+
+`sync-suspensions` 按全部历史成分拉取 Tushare `suspend_d` 的每日停牌（S）与复牌（R）事件，保存原始记录并形成有实际复牌日期的停牌区间；任务按代码记录断点，可在源接口中断后用相同日期重试。最新日审计会单独列出有源记录证明停牌的成分，不把其无行情和无估值当作同步缺口。
+
+`backfill-valuation-gaps` 逐日比对全部历史成分的真实行情与估值，只向 Tushare 请求有行情却缺估值的证券，并在写入后再次核对剩余日期；不会用默认估值代替源数据。
+
+数据检查完成后可运行独立 FACTOR 历史验证（收盘信号、下一交易日开盘成交）：
+
+```bash
+python -m quant.cli factor-backtest --start-date 2024-09-01 --end-date 2026-08-31 --top-n 30 --cost-bps 10
+```
+
+命令输出实际运行 ID、状态与有效调仓期数；只有 `completed` 才输出绩效指标。`partial`、`insufficient_data` 或失败时以非零状态退出，并保留原因。FACTOR 历史验证连续持仓、逐日收盘估值：证券停牌且有真实停牌记录时，按最后可见收盘价暂时结转并记审计；受阻订单持续跟踪，恢复可交易后按实际开盘价成交并计费。缺少行情且没有停牌证据时仍标记数据不足。CLI 中原有的 `backtest --model-run-id` 用于 MODEL 路径。
+
+使用 Docker 运行新命令前，先执行 `docker compose build streamlit` 更新共用的 `a-share-quant:dev` 镜像；代码修改不会自动进入已有镜像。完整性报告按最新行情日的真实沪深300成分快照计算，历史曾入选的证券不计入最新日缺口，并比较已落库的基准最新交易日；若基准自身也未更新，报告不能单独判断是否已追到今天。
 
 `scheduler` 服务会在 Asia/Shanghai 的交易日 18:30 自动执行增量同步；启动 Compose 后保持该服务运行即可。增量行情回补最近 5 个交易日窗口，财务数据回补最近 400 天，以吸收数据修订。可用 `python -m quant.cli run-scheduler --once` 手动检查当前是否到期。
 
@@ -100,7 +131,7 @@ MODEL 研究路径按以下顺序执行：
 4. 检查模型运行状态；最新未成熟 Label 的 PIT 特征通过 `infer` 从 Recorder 加载已训练模型独立预测，不进入历史 train/valid/test。
 5. 仅在模型状态为“已完成”时运行回测（`backtest`）；如果模型不可训练或失败，请先按页面提示补齐数据或重新构建因子历史。
 
-公开页面的“历史验证”是独立 FACTOR 路径，不读取 model run 或 prediction。页面根据所选区间生成月度调仓日，逐期检查并复用/补算版本化 PIT 因子快照，再按模板覆盖率规则实时评分；不足 70% 的证券不参与排名。运行过程显示真实的快照检查、补算、跳过和回测事件，最终以 `completed`、`partial` 或 `insufficient_data` 记录有效期数与跳过期数。MODEL 路径继续保留为独立研究方式。每个 DatasetH、模型、Recorder 和回测仅属于一个 market；未来 HK 会使用独立的 DatasetH、模型、Recorder 和回测，不默认与 CN 混合训练。
+公开页面的“历史回测实验”是独立 FACTOR 路径，不读取 model run 或 prediction。页面根据所选区间生成月度调仓日，逐期检查并复用/补算版本化 PIT 因子快照，再按模板覆盖率规则实时评分；不足 70% 的证券不参与排名。运行过程显示真实的快照检查、补算、跳过和回测事件，最终以 `completed`、`partial` 或 `insufficient_data` 记录有效期数与跳过期数。MODEL 路径继续保留为独立研究方式。每个 DatasetH、模型、Recorder 和回测仅属于一个 market；未来 HK 会使用独立的 DatasetH、模型、Recorder 和回测，不默认与 CN 混合训练。
 
 页面中的模型、因子和回测输出均为研究辅助信息与历史结果，不构成个性化投资建议，也不代表未来收益。
 
@@ -117,5 +148,15 @@ MODEL 研究路径按以下顺序执行：
 .venv/bin/uvicorn backend.app.main:app --reload --port 8000
 npm --prefix frontend install
 npm --prefix frontend run dev
-docker compose up --build postgres api frontend streamlit
+docker compose up --build postgres api frontend
 ```
+
+### 研究页面交互
+
+- 工作台保留每日选股推荐，并明确显示真实研究日期；旧快照标记为最新可用推荐、今日待更新。
+- 股票搜索按名称或代码查询，接口最多返回 50 条、页面每次取 20 条，不再加载全量股票下拉框。选股支持勾选后批量添加，每次明确选择目标组合；添加失败会说明已完成数量并允许继续添加剩余股票。
+- 组合按独立详情页管理。待调整清单不代表持仓；目标比例输入为 0–100%，先预览建仓、加仓、减仓、清仓或保持，再保存模拟计划。资金参数校验失败保留输入，成功写入后的读取失败会明确提示并清除旧结果。
+- 历史回测实验列表只读取保存的摘要与绩效，查看详情时才加载成交和曲线；区分设定区间与实际收益曲线区间。同名实验可按创建时间区分，部分完成的实验不展示完整绩效。
+- 收益曲线支持悬停、点击和日期滑块。选择日期后仅重放该日及之前的已保存成交，展示买入日期、持仓成本、模拟股数、持仓涨跌幅和当日成交；缺少所选日行情的字段显示 `--`。
+- 模拟股数包含复权和分红再投资的折算，允许小数，不等同券商整手持仓。成交价只在保存的复权开盘价与当日真实开盘行情一致时换算展示。
+- 策略卡片的权重直接来自后端模板定义。“稳健价值（原高股息）”保留 `high_dividend` 标识，明确说明其没有独立高股息率筛选门槛。

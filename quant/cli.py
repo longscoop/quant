@@ -7,10 +7,11 @@ import json
 import os
 from pathlib import Path
 
+from .ingestion import BASELINE_DATE
 from .storage import PostgresStore
 from .markets import DateSegment, ResearchContext, TimeSplitConfig
 from .markets.cn import CN_DEFAULT_CONTEXT, build_cn_market_config
-from .workflows import build_factor_run, run_backtest_run, run_model_inference, run_scheduler, run_scheduled_once, sync_benchmark, sync_hs300, sync_universe, train_model_run
+from .workflows import backfill_missing_members, backfill_valuation_gaps, build_factor_run, run_backtest_run, run_factor_backtest_run, run_model_inference, run_scheduler, run_scheduled_once, sync_benchmark, sync_hs300, sync_index_members_history, sync_suspensions_history, sync_universe, train_model_run
 
 
 def _date(value: str) -> date:
@@ -60,6 +61,30 @@ def main() -> None:
     benchmark.add_argument("--end-date", type=_date, default=date.today())
     benchmark.add_argument("--request-interval", type=float, default=0.35, help="Tushare 请求最小间隔（秒）；默认 0.35")
 
+    members = subparsers.add_parser("sync-index-members", help="逐月补齐沪深300历史成分快照")
+    members.add_argument("--token", default=tushare_token(None))
+    members.add_argument("--start-date", type=_date, required=True)
+    members.add_argument("--end-date", type=_date, default=date.today())
+    members.add_argument("--request-interval", type=float, default=0.35)
+
+    member_gaps = subparsers.add_parser("backfill-member-gaps", help="仅补齐缺少基础资料、行情、估值或财务数据的历史成分")
+    member_gaps.add_argument("--token", default=tushare_token(None))
+    member_gaps.add_argument("--start-date", type=_date, required=True)
+    member_gaps.add_argument("--end-date", type=_date, default=date.today())
+    member_gaps.add_argument("--request-interval", type=float, default=0.35)
+
+    suspensions = subparsers.add_parser("sync-suspensions", help="按历史成分补齐真实停复牌记录")
+    suspensions.add_argument("--token", default=tushare_token(None))
+    suspensions.add_argument("--start-date", type=_date, required=True)
+    suspensions.add_argument("--end-date", type=_date, default=date.today())
+    suspensions.add_argument("--request-interval", type=float, default=0.35)
+
+    valuation_gaps = subparsers.add_parser("backfill-valuation-gaps", help="只补齐有真实行情却缺少每日估值的历史成分日期")
+    valuation_gaps.add_argument("--token", default=tushare_token(None))
+    valuation_gaps.add_argument("--start-date", type=_date, required=True)
+    valuation_gaps.add_argument("--end-date", type=_date, default=date.today())
+    valuation_gaps.add_argument("--request-interval", type=float, default=0.35)
+
     universe = subparsers.add_parser("sync-universe", help="按证券池执行历史补数或增量同步")
     universe.add_argument("--token", default=tushare_token(None))
     universe.add_argument("--universe", choices=["hs300"], default="hs300")
@@ -67,6 +92,11 @@ def main() -> None:
     universe.add_argument("--start-date", type=_date)
     universe.add_argument("--end-date", type=_date, default=date.today())
     universe.add_argument("--request-interval", type=float, default=0.35, help="Tushare 请求最小间隔（秒）；默认 0.35")
+    backfill = subparsers.add_parser("backfill-data", help="补齐沪深300历史数据和基准开收盘价，并报告剩余缺口")
+    backfill.add_argument("--token", default=tushare_token(None))
+    backfill.add_argument("--start-date", type=_date, required=True)
+    backfill.add_argument("--end-date", type=_date, default=date.today())
+    backfill.add_argument("--request-interval", type=float, default=0.35)
     audit = subparsers.add_parser("audit-data", help="输出证券池数据完整性报告")
     audit.add_argument("--universe", choices=["hs300"], default="hs300")
     scheduler = subparsers.add_parser("run-scheduler", help="运行交易日18:30自动同步调度器")
@@ -107,12 +137,66 @@ def main() -> None:
     backtest.add_argument("--top-n", type=int, default=30)
     backtest.add_argument("--cost-bps", type=float, default=10.0)
 
+    factor_backtest = subparsers.add_parser("factor-backtest", help="按历史沪深300成分运行独立 FACTOR 月度回测")
+    factor_backtest.add_argument("--start-date", type=_date, required=True)
+    factor_backtest.add_argument("--end-date", type=_date, required=True)
+    factor_backtest.add_argument("--template-id", default="quality_growth")
+    factor_backtest.add_argument("--top-n", type=int, default=30)
+    factor_backtest.add_argument("--cost-bps", type=float, default=10.0)
+    factor_backtest.add_argument("--experiment-name")
+
     args = parser.parse_args()
     store = _store(args.database_url)
     if args.command == "init-db":
         store.initialize(); print(json.dumps({"status": "initialized"})); return
     if args.command == "audit-data":
         print(json.dumps(store.data_quality(args.universe), default=str, ensure_ascii=False)); return
+    if args.command == "factor-backtest":
+        if args.start_date > args.end_date:
+            parser.error("--start-date must be on or before --end-date")
+        run_id = run_factor_backtest_run(
+            store, start_date=args.start_date, end_date=args.end_date,
+            template_id=args.template_id, top_n=args.top_n, cost_bps=args.cost_bps,
+            experiment_name=args.experiment_name,
+        )
+        run = store.get_run(run_id)
+        payload = run.get("payload") or {}
+        print(json.dumps({"run_id": run_id, "status": run.get("status"), "error": run.get("error"), "coverage_summary": payload.get("coverage_summary"), "metrics": payload.get("metrics") if run.get("status") == "completed" else None, "status_reason": payload.get("status_reason")}, default=str, ensure_ascii=False))
+        if run.get("status") != "completed":
+            raise SystemExit(1)
+        return
+    if args.command == "backfill-data":
+        if not args.token:
+            parser.error("backfill-data requires --token or TUSHARE_TOKEN")
+        if args.start_date > args.end_date:
+            parser.error("--start-date must be on or before --end-date")
+        if args.start_date < BASELINE_DATE:
+            parser.error(f"--start-date must be on or after {BASELINE_DATE.isoformat()}")
+        universe_id = sync_universe(
+            store, args.token, universe="hs300", mode="backfill",
+            start_date=args.start_date, end_date=args.end_date,
+            request_interval=args.request_interval,
+        )
+        benchmark_id = sync_benchmark(
+            store, args.token, args.start_date, args.end_date,
+            benchmark=CN_DEFAULT_CONTEXT.benchmark_id,
+            request_interval=args.request_interval,
+        )
+        universe_run = store.get_run(universe_id)
+        benchmark_run = store.get_run(benchmark_id)
+        quality = store.data_quality("hs300")
+        statuses = {universe_run["status"], benchmark_run["status"]}
+        status = "failed" if "failed" in statuses else "partial" if statuses != {"completed"} or not quality.get("is_complete") else "completed"
+        summary = {
+            "status": status,
+            "universe_run": {key: universe_run.get(key) for key in ("run_id", "status", "error")},
+            "benchmark_run": {key: benchmark_run.get(key) for key in ("run_id", "status", "error")},
+            "quality": quality,
+        }
+        print(json.dumps(summary, default=str, ensure_ascii=False))
+        if status != "completed":
+            raise SystemExit(1)
+        return
     if args.command == "run-scheduler":
         if not args.token:
             parser.error("run-scheduler requires --token or TUSHARE_TOKEN")
@@ -127,6 +211,58 @@ def main() -> None:
         if not args.token:
             parser.error("sync-benchmark requires --token or TUSHARE_TOKEN")
         run_id = sync_benchmark(store, args.token, args.start_date, args.end_date, benchmark=args.benchmark, request_interval=args.request_interval)
+    elif args.command == "sync-index-members":
+        if not args.token:
+            parser.error("sync-index-members requires --token or TUSHARE_TOKEN")
+        if args.start_date > args.end_date:
+            parser.error("--start-date must be on or before --end-date")
+        if args.start_date < BASELINE_DATE:
+            parser.error(f"--start-date must be on or after {BASELINE_DATE.isoformat()}")
+        run_id = sync_index_members_history(store, args.token, args.start_date, args.end_date, request_interval=args.request_interval)
+        run = store.get_run(run_id)
+        print(json.dumps(run, default=str, ensure_ascii=False))
+        if run.get("status") != "completed":
+            raise SystemExit(1)
+        return
+    elif args.command == "backfill-member-gaps":
+        if not args.token:
+            parser.error("backfill-member-gaps requires --token or TUSHARE_TOKEN")
+        if args.start_date > args.end_date:
+            parser.error("--start-date must be on or before --end-date")
+        if args.start_date < BASELINE_DATE:
+            parser.error(f"--start-date must be on or after {BASELINE_DATE.isoformat()}")
+        run_id = backfill_missing_members(store, args.token, args.start_date, args.end_date, request_interval=args.request_interval)
+        run = store.get_run(run_id)
+        print(json.dumps(run, default=str, ensure_ascii=False))
+        if run.get("status") != "completed":
+            raise SystemExit(1)
+        return
+    elif args.command == "sync-suspensions":
+        if not args.token:
+            parser.error("sync-suspensions requires --token or TUSHARE_TOKEN")
+        if args.start_date > args.end_date:
+            parser.error("--start-date must be on or before --end-date")
+        if args.start_date < BASELINE_DATE:
+            parser.error(f"--start-date must be on or after {BASELINE_DATE.isoformat()}")
+        run_id = sync_suspensions_history(store, args.token, args.start_date, args.end_date, request_interval=args.request_interval)
+        run = store.get_run(run_id)
+        print(json.dumps(run, default=str, ensure_ascii=False))
+        if run.get("status") != "completed":
+            raise SystemExit(1)
+        return
+    elif args.command == "backfill-valuation-gaps":
+        if not args.token:
+            parser.error("backfill-valuation-gaps requires --token or TUSHARE_TOKEN")
+        if args.start_date > args.end_date:
+            parser.error("--start-date must be on or before --end-date")
+        if args.start_date < BASELINE_DATE:
+            parser.error(f"--start-date must be on or after {BASELINE_DATE.isoformat()}")
+        run_id = backfill_valuation_gaps(store, args.token, args.start_date, args.end_date, request_interval=args.request_interval)
+        run = store.get_run(run_id)
+        print(json.dumps(run, default=str, ensure_ascii=False))
+        if run.get("status") != "completed":
+            raise SystemExit(1)
+        return
     elif args.command == "sync-universe":
         if not args.token:
             parser.error("sync-universe requires --token or TUSHARE_TOKEN")

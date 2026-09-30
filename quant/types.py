@@ -251,6 +251,9 @@ class BacktestResult:
     annual_returns: list[dict[str, Any]] = field(default_factory=list)
     status_reason: str | None = None
     skipped_periods: list[dict[str, Any]] = field(default_factory=list)
+    completed_periods: int | None = None
+    valuation_audit: list[dict[str, Any]] = field(default_factory=list)
+    order_audit: list[dict[str, Any]] = field(default_factory=list)
 
 
 class PortfolioStatus(str, Enum):

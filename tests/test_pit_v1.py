@@ -240,6 +240,36 @@ class PitV1ScoringTests(unittest.TestCase):
             ["000002.SZ"],
         )
 
+    def test_pit_does_not_use_all_securities_before_first_membership_snapshot(self):
+        from quant.markets import ResearchContext
+        from quant.markets.cn import CnUniverseProvider
+        from quant.pit import PITRepository
+        from quant.providers import FixtureProvider
+        from quant.storage import InMemoryStore
+
+        store = InMemoryStore()
+        store.sync(FixtureProvider())
+        store.sync_index_members("000300.SH", [("000001.SZ", date(2024, 5, 1))])
+        context = ResearchContext("CN", "CNY", "CN_A_SHARE", "000300.SH", "000300.SH")
+
+        snapshot = PITRepository(store, context=context, universe_provider=CnUniverseProvider(store)).snapshot(date(2024, 4, 15))
+
+        self.assertEqual(snapshot.universe, [])
+
+    def test_pit_excludes_member_without_price_on_signal_trading_day(self):
+        from quant.pit import PITRepository
+        from quant.providers import FixtureProvider
+        from quant.storage import InMemoryStore
+
+        store = InMemoryStore()
+        store.sync(FixtureProvider())
+        store.prices.pop(("000001.SZ", date(2024, 4, 15)))
+
+        snapshot = PITRepository(store).snapshot(date(2024, 4, 15), universe=["000001.SZ"])
+
+        self.assertEqual(snapshot.universe, [])
+        self.assertEqual(snapshot.exclusions["000001.SZ"], "missing_price")
+
     def test_factor_snapshot_is_unique_per_date_and_versions(self):
         from quant.storage import InMemoryStore
 
@@ -279,6 +309,25 @@ class PitV1ScoringTests(unittest.TestCase):
 
         self.assertFalse(snapshot["reused"])
         self.assertEqual(snapshot["as_of_date"], date(2024, 4, 15))
+
+    def test_factor_snapshot_uses_only_explicit_historical_members(self):
+        from quant.factor_snapshots import ensure_factor_snapshot
+        from quant.pit import PITRepository
+        from quant.providers import FixtureProvider
+        from quant.storage import InMemoryStore
+
+        store = InMemoryStore()
+        store.sync(FixtureProvider())
+        as_of_date = date(2024, 4, 15)
+        store.sync_index_members("000300.SH", [("000001.SZ", as_of_date)])
+
+        snapshot = ensure_factor_snapshot(
+            store, as_of_date, universe_version="hs300:members-v3:test",
+            universe_codes=store.members_for("000300.SH", as_of_date),
+        )
+
+        self.assertEqual([item["ts_code"] for item in snapshot["items"]], ["000001.SZ"])
+        self.assertEqual(PITRepository(store).snapshot(as_of_date, universe=[]).universe, [])
 
 
 if __name__ == "__main__":

@@ -58,7 +58,14 @@ class PITRepository:
             # Compatibility-only calls without a market context operate on the
             # explicit store contents; they must not silently select a CN pool.
             historical_members = []
-        allowed = set(universe) if universe else set(historical_members or self.store.securities)
+        if universe is not None:
+            allowed = set(universe)
+        elif self.context is not None:
+            allowed = set(historical_members)
+        else:
+            allowed = set(self.store.securities)
+        benchmark_id = self.context.benchmark_id if self.context is not None else "000300.SH"
+        is_market_session = any(bar.trade_date == as_of_date for bar in self.store.benchmark_for(benchmark_id))
         included, financials, prices, industries, exclusions = [], [], {}, {}, {}
         for code in sorted(allowed):
             security = self.store.securities.get(code)
@@ -73,6 +80,8 @@ class PITRepository:
             if not history:
                 exclusions[code] = "missing_price"; continue
             last = history[-1]
+            if is_market_session and last.trade_date != as_of_date:
+                exclusions[code] = "missing_price"; continue
             if hasattr(self.store, "tradability_fact"):
                 market_fact = self.store.tradability_fact(code, last.trade_date, min_listing_days=self.min_listing_days)
                 if market_fact.suspended or market_fact.limit_up or market_fact.limit_down:

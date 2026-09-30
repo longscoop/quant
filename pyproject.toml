@@ -30,4 +30,4 @@ include = ["quant*"]
 exclude = ["data*", "tests*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "backend/tests"]

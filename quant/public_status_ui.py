@@ -15,6 +15,8 @@ _STAGES = (
 _STATUS_LABELS = {
     "completed": "可用",
     "not_trainable": "暂不可用",
+    "insufficient_data": "数据不足",
+    "partial": "部分完成",
     "failed": "暂不可用",
     "running": "准备中",
 }

@@ -141,6 +141,67 @@ class _ProviderRaisingSecretError:
 
 
 class AdminFinalFixTests(unittest.TestCase):
+    def test_truncated_index_response_never_becomes_a_pit_snapshot(self):
+        class Store(_SyncCaptureStore):
+            def sync_index_members(self, _index_code, members):
+                self.persisted_members = members
+
+        class Provider:
+            def __init__(self, _token, _start, _end, *, universe=None, **_kwargs):
+                self.universe = universe
+                self.errors = []
+
+            def index_weight(self, **_kwargs):
+                return pd.DataFrame([{"con_code": "000001.SZ", "trade_date": "20260831"}])
+
+        store = Store(historical_member_codes={"000001.SZ"})
+        with patch("quant.workflows.TushareProvider", Provider):
+            sync_universe(store, "test-token", universe="hs300", mode="backfill", start_date=date(2026, 8, 1), end_date=date(2026, 8, 31), _locked=True)
+
+        self.assertEqual(store.persisted_members, [])
+        self.assertEqual(store.finished[0]["status"], "partial")
+
+    def test_recent_sync_limits_requests_to_members_present_in_window(self):
+        """Old members outside a recent PIT window must not cause years of unrelated requests."""
+        class Store(_SyncCaptureStore):
+            def index_member_codes_for_window(self, index_code, start_date, end_date):
+                self.requested_window = (start_date, end_date)
+                return ["000001.SZ"]
+
+        class Provider:
+            def __init__(self, _token, _start, _end, *, universe=None, **_kwargs):
+                self.universe = universe
+                self.errors = []
+
+            def index_weight(self, **_kwargs):
+                return pd.DataFrame()
+
+        store = Store(historical_member_codes={"688169.SH"})
+        with patch("quant.workflows.TushareProvider", Provider):
+            sync_universe(store, "test-token", universe="hs300", mode="backfill", start_date=date(2026, 9, 4), end_date=date(2026, 9, 28), _locked=True)
+
+        self.assertEqual(store.synced_universe, ["000001.SZ"])
+        self.assertEqual(store.requested_window, (date(2026, 9, 4), date(2026, 9, 28)))
+
+    def test_saved_members_allow_market_repair_when_membership_api_fails_with_partial_status(self):
+        """Market rows may be repaired from real saved members, but membership refresh failure stays visible."""
+        store = _SyncCaptureStore(historical_member_codes={"688169.SH"})
+
+        class Provider:
+            def __init__(self, _token, _start, _end, *, universe=None, **_kwargs):
+                self.universe = universe
+                self.errors = []
+
+            def index_weight(self, **_kwargs):
+                raise RuntimeError("membership source timed out")
+
+        with patch("quant.workflows.TushareProvider", Provider):
+            sync_universe(store, "test-token", universe="hs300", start_date=date(2026, 9, 4), end_date=date(2026, 9, 28), _locked=True)
+
+        self.assertEqual(store.synced_universe, ["688169.SH"])
+        self.assertEqual(store.finished[0]["status"], "partial")
+        self.assertEqual(store.finished[0]["payload"]["dataset_errors"][0]["dataset"], "index_members")
+
     def test_incremental_sync_includes_saved_historical_members_in_market_universe(self):
         """Would fail if a current constituent response omitted a PIT-held stock's T+1 bars."""
         store = _SyncCaptureStore(historical_member_codes={"688169.SH"})

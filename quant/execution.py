@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from hashlib import sha256
+import json
 from math import floor
 from typing import Mapping
 
@@ -30,6 +32,27 @@ class ExecutionBatch:
     gross_traded: float
     transaction_cost: float
     turnover: float
+
+
+def execution_contract_digest(records: list[dict]) -> str:
+    """Fingerprint the shared order and cost terms used for engine comparison."""
+    keys = (
+        "signal_date", "execution_date", "instrument", "side",
+        "target_weight", "target_quantity", "executed_quantity", "reason",
+    )
+    cost_keys = (
+        "buy_commission_bps", "sell_commission_bps", "sell_tax_bps",
+        "minimum_commission", "slippage_bps", "cost_bps",
+    )
+    contract = [
+        {
+            **{key: row.get(key) for key in keys},
+            "cost_audit": {key: (row.get("cost_audit") or {}).get(key) for key in cost_keys},
+        }
+        for row in records
+    ]
+    payload = json.dumps(contract, sort_keys=True, default=str, separators=(",", ":"))
+    return sha256(payload.encode("utf-8")).hexdigest()
 
 
 def target_weight_turnover(
@@ -140,7 +163,7 @@ def execute_target_weights(
                 "price": None,
                 "side": "SELL" if weight == 0 and current > 0 else "BUY",
                 "requested": abs(target_quantities[code] - current),
-                "reason": "missing_open",
+                "reason": "missing_price" if bar is None else "missing_open",
                 "target_weight": weight,
             }
             continue
@@ -180,7 +203,7 @@ def execute_target_weights(
         current = float(working_holdings.get(code, 0.0))
         target = float(info["target"])
         requested = abs(target - current)
-        if requested <= 1e-12:
+        if requested <= 1e-12 and (info["reason"] is None or info["target_weight"] <= 0):
             continue
 
         side = "SELL" if target < current else "BUY"
@@ -189,19 +212,19 @@ def execute_target_weights(
             "signal_date": signal_date,
             "execution_date": execution_date,
             "instrument": code,
-            "side": side,
+            "side": None if price is None else side,
             "target_weight": float(info["target_weight"]),
-            "target_quantity": target,
-            "requested_quantity": requested,
+            "target_quantity": None if price is None else target,
+            "requested_quantity": None if price is None else requested,
         }
         if price is None:
             records.append(
                 {
                     **base_record,
                     "executed_quantity": 0.0,
-                    "actual_weight": 0.0,
-                    "reason": "missing_open",
-                    "remaining_quantity": requested,
+                    "actual_weight": None,
+                    "reason": info["reason"],
+                    "remaining_quantity": None,
                 }
             )
             continue

@@ -8,6 +8,7 @@ services:
     ports: ["5432:5432"]
     volumes: ["./data/postgres:/var/lib/postgresql/data"]
   streamlit:
+    profiles: ["legacy"]
     build: .
     image: a-share-quant:dev
     command: streamlit run streamlit_app.py --server.address=0.0.0.0
@@ -20,12 +21,17 @@ services:
     ports: ["8501:8501"]
     depends_on: [postgres]
   api:
+    build: .
     image: a-share-quant:dev
     command: uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
     environment:
       DATABASE_URL: postgresql+psycopg://quant:${POSTGRES_PASSWORD:-quant}@postgres:5432/quant
       QUANT_CORS_ORIGINS: ${QUANT_CORS_ORIGINS:-http://localhost:5173}
-    ports: ["8000:8000"]
+      QUANT_ADMIN_MODE: ${QUANT_ADMIN_MODE:-}
+      TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
+      QLIB_ARTIFACT_ROOT: /app/data/qlib
+    volumes: ["./data/qlib:/app/data/qlib"]
+    expose: ["8000"]
     depends_on: [postgres]
   frontend:
     build: ./frontend

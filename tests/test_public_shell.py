@@ -105,6 +105,39 @@ class PublicShellTests(unittest.TestCase):
         self.assertNotIn("验证完成", rendered)
         self.assertEqual(len(at.metric), 0)
 
+    def test_suspended_holding_shows_exact_skipped_period_without_performance_metrics(self):
+        at = self._validation_app("factor_suspended")
+
+        self.assertEqual(len(at.exception), 0)
+        rendered = self._rendered(at)
+        self.assertIn("有效 42 期，跳过 1 期", rendered)
+        self.assertIn("688041.SH", rendered)
+        self.assertIn("停牌持仓跨期延续", rendered)
+        self.assertIn("2025-04-30", rendered)
+        self.assertEqual(len(at.metric), 0)
+
+    def test_completed_validation_discloses_suspension_marks_and_deferred_execution(self):
+        at = self._validation_app("completed_with_suspension")
+
+        self.assertEqual(len(at.exception), 0)
+        rendered = self._rendered(at)
+        self.assertIn("停牌估值 1 条", rendered)
+        self.assertIn("受阻成交尝试 1 次", rendered)
+        self.assertIn("688041.SH", rendered)
+        self.assertIn("2025-06-10", rendered)
+        self.assertNotIn("样本不足：当前仅包含", rendered)
+
+    def test_template_change_updates_only_an_untouched_default_experiment_name(self):
+        at = self._validation_app("ready")
+        self.assertEqual(at.text_input[0].value, "质量成长 · 历史验证")
+
+        at.selectbox[0].set_value("value_growth").run()
+        self.assertEqual(at.text_input[0].value, "价值成长 · 历史验证")
+
+        at.text_input[0].set_value("自定义实验").run()
+        at.selectbox[0].set_value("quality_growth").run()
+        self.assertEqual(at.text_input[0].value, "自定义实验")
+
     def test_factor_submit_streams_snapshot_events_and_truthful_insufficient_summary(self):
         """Submitting without model data must exercise FACTOR snapshots and never emit fake completion."""
         at = self._validation_app("factor_ready_without_model")
@@ -114,7 +147,7 @@ class PublicShellTests(unittest.TestCase):
         self.assertEqual(len(at.exception), 0)
         rendered = self._rendered(at)
         self.assertIn("检查 2026-01-30 快照：缺失，开始 PIT 计算", rendered)
-        self.assertIn("执行结束：有效 0 期，跳过 2 期", rendered)
+        self.assertIn("执行结束：有效 0 期，跳过 1 期", rendered)
         self.assertIn("数据不足", rendered)
         self.assertNotIn("验证完成", rendered)
 
